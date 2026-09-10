@@ -24,7 +24,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 1;
+const APP_VERSION = 2;
 
 /* ============================================================== constants  */
 

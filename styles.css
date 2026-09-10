@@ -23,6 +23,25 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute hides an element through the UA rule
+   `[hidden] { display: none }`, whose specificity is (0,1,0) — the same as any
+   class selector. A tie goes to the author stylesheet, so every rule below that
+   sets `display` on a class silently cancelled `hidden` on that element.
+
+   That was not a cosmetic problem. `.modal` sets `display: grid`, so all five
+   modals rendered at once, stacked, each behind its own 72%-opaque backdrop:
+   the app came up as a black page with an empty merge sheet floating on it and
+   the buy sheet blurred behind. `.progress`, `.pipCount` and `.barStats` had
+   the same defect.
+
+   Two layers, because the second is the one that is actually load-bearing.
+   This rule catches anything added later. But `!important` is exactly the sort
+   of thing a future edit adds a louder `!important` to defeat, so every class
+   that sets `display` on a hideable element is ALSO written as
+   `:not([hidden])`: at (0,2,0) it simply does not apply when the element is
+   hidden, and the UA rule wins on its own with nothing to fight. */
+[hidden] { display: none !important; }
+
 html { scroll-behavior: smooth; }
 
 body {
@@ -101,13 +120,13 @@ button.danger:hover { background: #2a1618; }
 button.iconBtn { padding: 8px 10px; }
 button.tiny { padding: 4px 9px; font-size: 12.5px; border-radius: 7px; }
 
-.pipCount {
+.pipCount:not([hidden]) {
   display: inline-block; min-width: 18px; text-align: center;
   background: var(--accent); color: #10131a; border-radius: 999px;
   font: 700 11px/18px var(--mono); margin-left: 4px;
 }
 
-.barStats { padding: 0 16px 10px; display: grid; gap: 7px; }
+.barStats:not([hidden]) { padding: 0 16px 10px; display: grid; gap: 7px; }
 .headline { font-size: 13.5px; color: var(--fg2); }
 .viewHint { font-size: 12.5px; color: var(--fg3); }
 
@@ -150,7 +169,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 
 /* --------------------------------------------------------------- progress */
 
-.progress { display: flex; align-items: center; gap: 12px; padding: 8px 16px 12px; }
+.progress:not([hidden]) { display: flex; align-items: center; gap: 12px; padding: 8px 16px 12px; }
 .progress .bar { flex: 1; height: 5px; background: var(--bg3); border-radius: 999px; overflow: hidden; }
 .progress .bar i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s; }
 .progress span { font: 500 12.5px/1 var(--mono); color: var(--fg2); white-space: nowrap; }
@@ -342,7 +361,7 @@ h2.sec:first-child { margin-top: 0; }
 
 /* ------------------------------------------------------------------ modals */
 
-.modal {
+.modal:not([hidden]) {
   position: fixed; inset: 0; z-index: 60;
   background: rgba(6,8,11,.72); backdrop-filter: blur(3px);
   display: grid; place-items: center; padding: 20px;

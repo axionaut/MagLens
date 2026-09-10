@@ -256,6 +256,50 @@ summary length and topic count.
 
 ---
 
+## 2A. v2 — the app did not run at all
+
+Reported from the live Pages deploy, as a black page with an empty panel
+floating on it and a blurred "Mark as bought" sheet behind that.
+
+**Cause.** The `hidden` attribute hides an element through the UA stylesheet rule
+`[hidden] { display: none }`, whose specificity is (0,1,0) — identical to a class
+selector. On a specificity tie the author stylesheet wins, so `.modal { display:
+grid }` cancelled `hidden` on every modal. All five rendered simultaneously,
+each with its own `rgba(6,8,11,.72)` backdrop; five of those stacked is opaque
+black over `#main` and over the topbar at its lower z-index. The topmost in DOM
+order, `#mergeModal`, showed as an empty `.modalBody.wide` — 900px wide, 48px
+tall, exactly the floating panel in the report — and its `backdrop-filter`
+blurred `#buyModal` beneath it.
+
+The giveaway in the screenshot was that the buy sheet read "Mark as bought", the
+literal string in `index.html`. Had `openBuy()` ever run it would have read
+"Bought: *title*". Nothing had opened these modals; they had never been closed.
+
+`.progress` (`display: flex`), `.pipCount` (`display: inline-block`) and
+`.barStats` (`display: grid`) carried the same defect. `#deck`, `#btnStop`,
+`#btnTop` and `#importFile` were unaffected because no class sets `display` on
+them — which is why the bug was invisible in review: it depended on a property
+set somewhere else in the file.
+
+**Fix, in two layers.** A global `[hidden] { display: none !important; }` catches
+anything added later. But `!important` invites a louder `!important` to defeat
+it, so each of the four classes is additionally written `:not([hidden])`, which
+at (0,2,0) simply does not apply while the element is hidden, leaving the UA rule
+to win uncontested. The second layer is the load-bearing one.
+
+**Why the test suites missed it.** Both harnesses render in jsdom without the
+stylesheet attached, so they exercised the DOM and the JS and could not see a
+cascade problem. A CSS check was added: `styles.css` inlined into the real
+`index.html`, asserting `getComputedStyle(el).display === 'none'` for every
+element carrying `hidden`, and asserting that each one still toggles both ways.
+Run against the pre-fix stylesheet it reports all six modals plus `progress` and
+`filterCount` leaking; after, none.
+
+Note that jsdom's cascade ignores `!important`, so it can only verify the
+`:not([hidden])` layer — which is the layer that matters.
+
+---
+
 ## 3. Verification performed
 
 No assertion suite is kept in the repository. The following were run against

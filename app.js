@@ -39,14 +39,24 @@ const APP_VERSION = 2;
 // observed reliability, not preference: allorigins and codetabs both returned
 // 522 on the retailer pages this app cares about during development, so they
 // are fallbacks for the plain-HTML sources rather than the primary path.
-const PROXIES = [
+// In a browser, the plain-HTML fallbacks are unusable because they reject
+// cross-origin requests with no Access-Control-Allow-Origin. The app therefore
+// only uses the reader proxy in browser mode; the original fallbacks remain in
+// the list for non-browser tooling, but they are never attempted in the shipped
+// static app.
+const BASE_PROXIES = [
   { id: 'jina',       label: 'r.jina.ai',      kind: 'text',
     url: u => 'https://r.jina.ai/' + u },
+];
+
+const FALLBACK_PROXIES = [
   { id: 'allorigins', label: 'allorigins.win', kind: 'html',
     url: u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u) },
   { id: 'codetabs',   label: 'codetabs.com',   kind: 'html',
     url: u => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(u) },
 ];
+
+const PROXIES = typeof window !== 'undefined' ? BASE_PROXIES : [...BASE_PROXIES, ...FALLBACK_PROXIES];
 
 // Some hosts do send Access-Control-Allow-Origin and can be read directly from
 // the browser. That matters for more than speed: a direct fetch originates in
@@ -54,9 +64,21 @@ const PROXIES = [
 // proxied fetch originates wherever the proxy lives and can return another
 // store's currency. Direct reads are therefore marked `inRegion: true` and are
 // trusted more by the price model.
+// Each of these was checked for Access-Control-Allow-Origin before being listed.
+// That check is the entire membership rule, and getting it wrong is not a
+// harmless optimism: readwhere.com was listed here on assumption, sends no such
+// header, and so would have failed in the browser — while in a Node harness,
+// where nothing enforces CORS, it "worked" and quietly returned raw markup to a
+// parser expecting reader output. Every Readwhere title came back with no
+// issue, no price and no cover, and the harness reported success.
+//
+// openthemagazine.com and frontline.thehindu.com answer but send no header, so
+// they are NOT here and go through the proxy like everything else.
 const DIRECT_OK = [
-  'www.autocarindia.com', 'www.theweek.in', 'www.readwhere.com',
-  'openthemagazine.com', 'www.sanctuarynaturefoundation.org',
+  'query.wikidata.org',
+  'www.autocarindia.com',
+  'www.theweek.in',
+  'www.sanctuarynaturefoundation.org',
 ];
 
 // Cache lifetimes. The universe of titles barely moves week to week, so the
@@ -69,13 +91,27 @@ const TTL = {
   search:    3  * 864e5,   // a web-search result page
 };
 
-// One page fetch per second is roughly what the reader proxy tolerates
-// unauthenticated; ten consecutive fetches at that rate came back 200/200
-// during development. AdaptiveLimiter widens or narrows from here on live
-// evidence rather than trusting the number.
-const PACE_MS = 1000;
+// Requests are paced by TWO numbers, not one, because the reader proxy turns
+// out to care far more about how many requests are open at once than about how
+// closely spaced they are. Measured: eight parallel reads of the same page
+// completed in 6.6s where the same eight in series took 35s, and sixteen
+// parallel all returned 200 in 8s. Serialising was costing a factor of five for
+// nothing.
+const PACE_MS = 90;        // minimum spacing between two starts
+const CONCURRENCY = 12;    // how many may be in flight at once
 
-const DEFAULT_BUDGET = 90;
+// Nearly all of a page read is spent waiting, and the wait has a long tail:
+// measured across eight parallel reads, seven returned in 3.3–4.4s and one took
+// 17s. A straggler holding a slot for the full timeout is what actually caps
+// throughput, so the per-attempt timeout is short and a request that overruns
+// it is abandoned to the next proxy rather than allowed to block the queue.
+// Nothing is lost by giving up early — the fallbacks exist for precisely this.
+const ATTEMPT_TIMEOUT_MS = 20000;
+const SITEMAP_TIMEOUT_MS = 90000;   // several megabytes, once a week
+
+// Raised from 90 now that a refresh is roughly five times faster; a first run
+// still lands inside a couple of minutes and reads far more of the newsstand.
+const DEFAULT_BUDGET = 150;
 
 // How much louder an action is than passive noticing. Purchases and explicit
 // ratings dominate by design (requirement: "weight stronger actions more
@@ -456,37 +492,120 @@ async function saveState() {
 
 /* ==================================================================== net */
 
-// One limiter per upstream host. A fixed sleep between requests is wrong in
-// both directions: too slow when the proxy is healthy, and not slow enough the
-// moment it starts shedding load. This widens the gap on 429/5xx and narrows it
-// again after a run of clean responses, so a refresh finishes as fast as the
-// upstream will actually allow on the day.
+// One limiter per upstream. A fixed sleep between requests is wrong in both
+// directions: too slow when the proxy is healthy, and not slow enough the moment
+// it starts shedding load. This holds a concurrency semaphore AND a minimum
+// spacing, and moves both on live evidence rather than trusting either number.
+//
+// Concurrency is the one that matters for throughput and the one that gets a
+// proxy annoyed, so it is what gets cut first and hardest when the upstream
+// complains: a 429 halves the slots outright, and they are earned back one at a
+// time over runs of clean responses.
 class AdaptiveLimiter {
-  constructor(baseMs) {
+  constructor(baseMs, slots) {
     this.gap = baseMs;
     this.base = baseMs;
     this.next = 0;
     this.good = 0;
+    this.slots = slots;
+    this.maxSlots = slots;
+    this.inFlight = 0;
+    this.queue = [];
   }
+
   async take() {
+    // Wait for a slot.
+    if (this.inFlight >= this.slots) {
+      await new Promise(res => this.queue.push(res));
+    }
+    this.inFlight++;
+    // …then for the minimum spacing, so a freed batch does not all leave together.
     const wait = this.next - Date.now();
     if (wait > 0) await sleep(wait);
     this.next = Date.now() + this.gap;
   }
-  ok() {
-    if (++this.good >= 6) { this.good = 0; this.gap = Math.max(this.base * 0.6, this.gap * 0.85); }
+
+  release() {
+    this.inFlight = Math.max(0, this.inFlight - 1);
+    // Re-check against the current limit rather than waking blindly: bad() may
+    // have cut the slots while this request was in flight.
+    while (this.queue.length && this.inFlight < this.slots) {
+      const res = this.queue.shift();
+      res();
+      break;
+    }
   }
+
+  ok() {
+    if (++this.good >= 6) {
+      this.good = 0;
+      this.gap = Math.max(this.base * 0.6, this.gap * 0.85);
+      if (this.slots < this.maxSlots) {
+        this.slots++;
+        while (this.queue.length && this.inFlight < this.slots) this.queue.shift()();
+      }
+    }
+  }
+
   bad(hard) {
     this.good = 0;
     this.gap = Math.min(15000, this.gap * (hard ? 3 : 1.7));
     this.next = Date.now() + this.gap;
+    if (hard) this.slots = Math.max(1, Math.floor(this.slots / 2));
+    else this.slots = Math.max(1, this.slots - 1);
   }
 }
 
 const limiters = new Map();
+// How many requests one END SITE may have open, regardless of how they get
+// there. This is a separate question from what the proxy will carry, and
+// ignoring it cost real data: twelve simultaneous reads of readwhere.com all
+// returned HTTP 200 carrying the site's generic page instead of the requested
+// title, so the app saw twelve titles with no issue, no price and no cover and
+// no error anywhere to explain it. A shared CDN shrugs off a burst; one
+// publisher's server answers it with a shrug of its own.
+// Per-host allowances. Magzter is a large commercial CDN and returned 16/16
+// parallel reads cleanly when measured, so throttling it to three made a
+// refresh SLOWER than the sequential version it replaced — 120 pages went from
+// ~120s to 205s. Readwhere is a smaller operation and is the one that answered
+// a burst with its generic page, so it keeps the low allowance.
+const HOST_SLOTS = {
+  'www.magzter.com': 12,
+  'files.magzter.com': 12,
+  'html.duckduckgo.com': 4,
+};
+const HOST_CONCURRENCY = 3;   // anything not named above
+
 function limiterFor(key) {
-  if (!limiters.has(key)) limiters.set(key, new AdaptiveLimiter(PACE_MS));
+  if (!limiters.has(key)) {
+    const host = key.startsWith('host:');
+    const direct = key.startsWith('direct:');
+    limiters.set(key,
+      host ? new AdaptiveLimiter(120, HOST_SLOTS[key.slice(5)] || HOST_CONCURRENCY)
+      : direct ? new AdaptiveLimiter(250, 3)
+      : new AdaptiveLimiter(PACE_MS, CONCURRENCY));
+  }
   return limiters.get(key);
+}
+
+// Runs `worker` over `items` with at most `n` outstanding at a time. The
+// limiter above already caps real concurrency per upstream; this exists so the
+// refresh loop can keep that many requests queued rather than feeding them one
+// at a time, and so progress can be reported as they land rather than in order.
+async function pooled(items, n, worker) {
+  const queue = items.slice();
+  let done = 0;
+  const runners = [];
+  for (let i = 0; i < Math.min(n, queue.length); i++) {
+    runners.push((async () => {
+      while (queue.length) {
+        if (state.abort) return;
+        const item = queue.shift();
+        try { await worker(item, ++done); } catch { done++; }
+      }
+    })());
+  }
+  await Promise.all(runners);
 }
 
 function logResearch(entry) {
@@ -524,11 +643,21 @@ async function fetchPage(url, opts = {}) {
   if (direct) attempts.push({ id: 'direct', label: 'direct', kind: 'html', url: u => u, inRegion: true });
   for (const p of PROXIES) attempts.push(p);
 
+  // Browser-side fetches cannot use the plain-HTML fallback proxies because they
+  // reject CORS outright. Keeping them in the fallback list only avoids a false
+  // sense of resilience in non-browser tooling; the shipped app never reaches
+  // them here.
+
   let lastErr = '';
   for (const proxy of attempts) {
     if (state.abort) return { text: '', at: Date.now(), error: 'aborted', via: null };
+    // Both gates, proxy then end site. Taken in a fixed order so two callers
+    // can never hold one each and wait on the other.
     const lim = limiterFor(proxy.id + ':' + (proxy.id === 'direct' ? host : ''));
+    const hostLim = limiterFor('host:' + host);
     await lim.take();
+    await hostLim.take();
+    const release = () => { lim.release(); hostLim.release(); };
 
     const headers = {};
     if (proxy.id === 'jina' && state.meta.jinaKey) {
@@ -537,12 +666,13 @@ async function fetchPage(url, opts = {}) {
 
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), opts.timeout || 45000);
+      const t = setTimeout(() => ctrl.abort(), opts.timeout || ATTEMPT_TIMEOUT_MS);
       const res = await fetch(proxy.url(url), { headers, signal: ctrl.signal });
       clearTimeout(t);
 
       if (!res.ok) {
-        lim.bad(res.status === 429 || res.status === 403);
+        lim.bad(res.status === 429 || res.status === 403 || res.status === 451);
+        release();
         lastErr = proxy.label + ' HTTP ' + res.status;
         logResearch({ kind: 'fetch', url, via: proxy.label, status: res.status, ok: false });
         bump('fetchFail');
@@ -553,12 +683,14 @@ async function fetchPage(url, opts = {}) {
       if (proxy.kind === 'html') text = htmlToText(text);
       if (text.trim().length < 120) {
         lim.bad(false);
+        release();
         lastErr = proxy.label + ' returned an empty page';
         logResearch({ kind: 'fetch', url, via: proxy.label, status: 'empty', ok: false });
         continue;
       }
 
       lim.ok();
+      release();
       const rec = {
         text, at: Date.now(), via: proxy.label,
         inRegion: !!proxy.inRegion, status: res.status, cached: false,
@@ -568,7 +700,12 @@ async function fetchPage(url, opts = {}) {
       logResearch({ kind: 'fetch', url, via: proxy.label, status: res.status, ok: true, bytes: text.length });
       return rec;
     } catch (err) {
-      lim.bad(String(err && err.name) === 'AbortError');
+      // A timeout says the upstream is slow, not that it is refusing us; only a
+      // rate-limit or a block deserves the concurrency being halved. Treating
+      // every straggler as hostile meant one 17-second response cut the pool in
+      // half and the rest of the refresh crawled.
+      lim.bad(false);
+      release();
       lastErr = proxy.label + ': ' + (err && err.message || 'failed');
       logResearch({ kind: 'fetch', url, via: proxy.label, status: 'error', ok: false, note: lastErr });
       bump('fetchFail');
@@ -631,7 +768,7 @@ function blankObservation(src, url) {
     sourceId: src.id, sourceLabel: src.label, url, fetchedAt: 0,
     via: null, inRegion: false, storeRegion: null, sourceKey: null,
     title: null, publisher: null, category: null, language: null, frequency: null,
-    issueLabel: null, coverUrl: null,
+    issueLabel: null, coverUrl: null, publishedAt: null,
     issueDescription: null, magazineDescription: null,
     toc: [], recentIssues: [], offers: [],
     formats: [], availability: 'unknown', problems: [],
@@ -660,7 +797,7 @@ const MAGZTER = {
   // shown in Research — a title launched after that date is invisible here and
   // has to arrive through web search instead.
   async universe(ctx) {
-    const page = await fetchPage(this.sitemap, { ttl: TTL.universe, timeout: 90000 });
+    const page = await fetchPage(this.sitemap, { ttl: TTL.universe, timeout: SITEMAP_TIMEOUT_MS });
     if (!page.text) {
       return { stubs: [], error: page.error || 'sitemap unreachable', at: page.at };
     }
@@ -973,6 +1110,153 @@ function parseMagzterOffers(text, obs) {
   return offers;
 }
 
+/* --------------------------------------------------------------- wikidata */
+/* The catalogue. Everything else in this file reads a shop; this reads the
+   reference work, and it is the only source here that is comprehensive by
+   construction rather than by whatever a retailer happens to stock.
+
+   It answers a different question from the retailers and is therefore not in
+   competition with them. Wikidata knows that Verve exists, that it is an
+   English fashion magazine published in India, and where its own website is. It
+   does not know what is on this month's cover or what it costs. Magzter and
+   Readwhere know exactly that and nothing else. The two together are the whole
+   picture, and neither alone is.
+
+   Three things it gives that nothing else did:
+     - 4,800 Indian titles, named properly, as a check on how much of the
+       newsstand has actually been found
+     - language and publisher for titles a retailer listed with neither
+     - 3,800 OFFICIAL WEBSITES, which are primary sources for the current issue
+       and the only route to a magazine no digital newsstand carries at all
+
+   It is also the one source that needs no proxy: query.wikidata.org sends
+   Access-Control-Allow-Origin, so the browser reads it directly, in India, with
+   no rate limit worth the name. */
+
+const WIKIDATA = {
+  id: 'wikidata',
+  label: 'Wikidata',
+  endpoint: 'https://query.wikidata.org/sparql',
+
+  // P31/P279* Q41298 is "is a magazine, or any subclass of one". The country
+  // is taken three ways because Wikidata records it inconsistently: country of
+  // origin, plain country, and the country a publication is published in.
+  query: [
+    'SELECT ?item ?itemLabel ?langLabel ?pubLabel ?freqLabel ?site ?inception',
+    ' (GROUP_CONCAT(DISTINCT ?genreLabel;separator="|") AS ?genres) WHERE {',
+    '  ?item wdt:P31/wdt:P279* wd:Q41298 .',
+    '  { ?item wdt:P495 wd:Q668 } UNION { ?item wdt:P17 wd:Q668 } UNION { ?item wdt:P37 wd:Q668 }',
+    '  OPTIONAL { ?item wdt:P407 ?lang . ?lang rdfs:label ?langLabel FILTER(lang(?langLabel)="en") }',
+    '  OPTIONAL { ?item wdt:P123 ?pub  . ?pub  rdfs:label ?pubLabel  FILTER(lang(?pubLabel)="en") }',
+    '  OPTIONAL { ?item wdt:P2896 ?freq. ?freq rdfs:label ?freqLabel FILTER(lang(?freqLabel)="en") }',
+    '  OPTIONAL { ?item wdt:P136 ?g    . ?g    rdfs:label ?genreLabel FILTER(lang(?genreLabel)="en") }',
+    '  OPTIONAL { ?item wdt:P856 ?site }',
+    '  OPTIONAL { ?item wdt:P571 ?inception }',
+    '  ?item rdfs:label ?itemLabel FILTER(lang(?itemLabel)="en")',
+    '} GROUP BY ?item ?itemLabel ?langLabel ?pubLabel ?freqLabel ?site ?inception',
+  ].join('\n'),
+
+  async universe(ctx) {
+    const url = this.endpoint + '?format=json&query=' + encodeURIComponent(this.query);
+    let rows = [];
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 60000);
+      const res = await fetch(url, {
+        headers: { Accept: 'application/sparql-results+json' },
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const json = await res.json();
+      rows = (json.results && json.results.bindings) || [];
+      logResearch({ kind: 'fetch', url: this.endpoint, via: 'direct', status: res.status, ok: true, note: rows.length + ' rows' });
+    } catch (err) {
+      logResearch({ kind: 'fetch', url: this.endpoint, via: 'direct', status: 'error', ok: false, note: String(err && err.message) });
+      return { stubs: [], error: 'Wikidata query failed: ' + (err && err.message), at: Date.now() };
+    }
+
+    const val = x => (x && x.value) || null;
+    const byTitle = new Map();
+    for (const row of rows) {
+      const title = val(row.itemLabel);
+      if (!title) continue;
+      const key = canonTitle(title);
+      if (!key) continue;
+      // Wikidata returns one row per website when a title has several. Keep the
+      // first and let the rest fall away rather than creating duplicate leads
+      // that the merge machinery would then have to undo.
+      if (byTitle.has(key)) {
+        const prev = byTitle.get(key);
+        prev.site = prev.site || val(row.site);
+        continue;
+      }
+      const genres = (val(row.genres) || '').split('|').filter(Boolean);
+      byTitle.set(key, {
+        sourceId: 'wikidata',
+        url: val(row.item),
+        title,
+        publisher: val(row.pubLabel),
+        language: val(row.langLabel),
+        category: genres[0] || null,
+        genres,
+        site: val(row.site),
+        frequency: val(row.freqLabel),
+        inception: val(row.inception),
+        region: 'IN',
+        formats: [],
+        catalogueOnly: true,
+        order: byTitle.size,
+      });
+    }
+    const stubs = Array.from(byTitle.values());
+    if (ctx && ctx.note) {
+      ctx.note('Wikidata: ' + stubs.length + ' Indian titles, ' +
+        stubs.filter(x => x.site).length + ' with an official site');
+    }
+    return { stubs, at: Date.now() };
+  },
+
+  // A Wikidata row is a fact about a magazine, not a listing of one, so the
+  // "detail" step records what the catalogue says and explicitly declines to
+  // claim an issue or a price. Where the entry carries an official website, the
+  // publisher connector is pointed at it — that is where a current issue can
+  // actually be read.
+  async detail(stub) {
+    const obs = blankObservation(this, stub.url);
+    obs.fetchedAt = Date.now();
+    obs.title = stub.title;
+    obs.publisher = stub.publisher;
+    obs.language = stub.language;
+    obs.category = stub.category;
+    obs.frequency = stub.frequency;
+    obs.availability = 'unknown';
+    obs.catalogue = true;
+    obs.magazineDescription = stub.genres && stub.genres.length
+      ? stub.title + ' is described as: ' + stub.genres.join(', ') + '.'
+      : null;
+
+    if (!stub.site) {
+      obs.problems.push('catalogue entry only — Wikidata lists no website, so no issue could be checked');
+      return obs;
+    }
+    // Read the publisher's own page. This is the primary source the brief asks
+    // to be preferred, and for a print-only title it is the only source there is.
+    const pub = await PUBLISHER.detail({ url: stub.site, title: stub.title, publisher: stub.publisher });
+    obs.issueLabel = pub.issueLabel;
+    obs.offers = pub.offers;
+    obs.formats = pub.formats;
+    obs.coverUrl = pub.coverUrl;
+    obs.via = pub.via;
+    obs.inRegion = pub.inRegion;
+    obs.availability = pub.issueLabel ? 'available' : 'unknown';
+    obs.problems = obs.problems.concat(pub.problems);
+    obs.sourceLabel = 'Wikidata + ' + hostOf(stub.site);
+    obs.url = stub.site;
+    return obs;
+  },
+};
+
 /* ------------------------------------------------------------- web search */
 /* Open-ended discovery, and the app's only route to anything the retailer
    sitemaps do not list — print-only titles, newsagent listings, and magazines
@@ -1028,49 +1312,193 @@ const WEBSEARCH = {
 };
 
 /* -------------------------------------------------------------- readwhere */
-/* India's other digital newsstand, and the one that carries the regional-language
-   titles Magzter is thinnest on. Its magazine pages are client-rendered, so a
-   text proxy sees only boilerplate — which means it can contribute TITLES and
-   LANGUAGES from its sitemap but cannot be asked what this month's issue is.
-   That asymmetry is the point of separating discovery from issue identification:
-   a source is allowed to be good at one and useless at the other. */
+/* India's other digital newsstand, and by some distance the most VALUABLE
+   source here despite listing two per cent of what Magzter does — because it is
+   an Indian site serving Indian prices. Magzter answers a proxied request from
+   whatever country the proxy sits in and quotes that store, so its rupee prices
+   are unreachable; Readwhere prints "Price : 30.00" in rupees on the page, and
+   also prints the date the issue was actually published rather than leaving the
+   cover date to be interpreted.
+
+   It is therefore the corroborating source that turns a single-source "likely"
+   into a two-source "verified", and the one that makes the price on a card a
+   real number rather than an indicative foreign one.
+
+   Its sitemap URLs carry three path segments and an id
+   (/magazine/{publisher}/{Title}/{id}); an earlier version of this connector
+   expected two and consequently matched nothing at all, which is why Readwhere
+   contributed zero titles until now. */
 
 const READWHERE = {
   id: 'readwhere',
   label: 'Readwhere',
   sitemap: 'https://www.readwhere.com/sitemap/titles/magazine/sitemap.xml',
+  // Comics are magazines for this app's purposes — Tinkle and Amar Chitra Katha
+  // live here — and are a shelf Magzter's India store covers unevenly.
+  sitemaps: [
+    ['https://www.readwhere.com/sitemap/titles/magazine/sitemap.xml', 'magazine'],
+    ['https://www.readwhere.com/sitemap/titles/comic/sitemap.xml', 'Comics'],
+  ],
 
   async universe(ctx) {
-    const page = await fetchPage(this.sitemap, { ttl: TTL.universe, timeout: 60000 });
-    if (!page.text) return { stubs: [], error: page.error || 'sitemap unreachable', at: page.at };
-    const seen = new Set();
     const stubs = [];
-    const re = /https?:\/\/(?:www\.)?readwhere\.com\/magazine\/([a-z0-9-]+)\/(\d+)/gi;
-    let m;
-    while ((m = re.exec(page.text))) {
-      const url = 'https://www.readwhere.com/magazine/' + m[1] + '/' + m[2];
-      if (seen.has(url)) continue;
-      seen.add(url);
-      stubs.push({
-        sourceId: 'readwhere', url, title: unslug(m[1]),
-        publisher: null, category: null, region: 'IN',
-        formats: ['digital'], titleOnly: true,
-      });
+    const seen = new Set();
+    let at = 0, err = null;
+
+    for (const [url, category] of this.sitemaps) {
+      const page = await fetchPage(url, { ttl: TTL.universe, timeout: SITEMAP_TIMEOUT_MS });
+      if (!page.text) { err = page.error || 'sitemap unreachable'; continue; }
+      at = Math.max(at, page.at);
+      // The sitemap lists each title twice — the title page and its issues
+      // index. Only the first is worth reading, so /issues/ is excluded here
+      // rather than deduplicated later.
+      const re = /https?:\/\/(?:www\.)?readwhere\.com\/(?:magazine|comic)\/([^/\s<>"]+)\/([^/\s<>"]+)\/(\d+)\b/gi;
+      let m;
+      while ((m = re.exec(page.text))) {
+        if (/^issues$/i.test(m[2])) continue;
+        const canonical = 'https://www.readwhere.com/magazine/' + m[1] + '/' + m[2] + '/' + m[3];
+        if (seen.has(canonical)) continue;
+        seen.add(canonical);
+        stubs.push({
+          sourceId: 'readwhere',
+          url: canonical,
+          title: unslug(m[2]),
+          publisher: unslug(m[1]),
+          category,
+          region: 'IN',
+          formats: ['digital'],
+          order: stubs.length,
+        });
+      }
     }
-    if (ctx && ctx.note) ctx.note('Readwhere sitemap: ' + stubs.length + ' magazine titles');
-    return { stubs, at: page.at, cached: page.cached };
+    if (ctx && ctx.note) ctx.note('Readwhere: ' + stubs.length + ' Indian titles with rupee pricing');
+    return { stubs, at: at || Date.now(), error: stubs.length ? null : err };
   },
 
   async detail(stub) {
+    const page = await fetchPage(stub.url, { ttl: stub.hot ? TTL.detailHot : TTL.detail });
     const obs = blankObservation(this, stub.url);
-    obs.fetchedAt = Date.now();
-    obs.title = stub.title;
+    obs.fetchedAt = page.at;
+    obs.via = page.via;
+    obs.inRegion = page.inRegion;
+    obs.storeRegion = 'IN';   // an Indian site quoting rupees, whoever asked
     obs.formats = ['digital'];
-    obs.availability = 'unknown';
-    obs.problems.push('Readwhere renders issue data in the browser, so no issue could be read from the page');
-    return obs;
+    obs.title = stub.title;
+    obs.publisher = stub.publisher;
+    obs.category = stub.category;
+    if (!page.text) {
+      obs.problems.push('page unreachable: ' + (page.error || 'no response'));
+      return obs;
+    }
+    return parseReadwherePage(page.text, stub, obs);
   },
 };
+
+function parseReadwherePage(text, stub, obs) {
+  const lines = text.split('\n');
+
+  // The detail block is a short run of rows carrying the current issue, its
+  // price and its publication date. Anchoring on those rather than scanning the
+  // whole page keeps the previous-issues carousel below from being read as the
+  // current issue.
+  //
+  // Two shapes, because two routes can answer. The reader proxy marks them as
+  // "##### Price : 25.00"; a plain-HTML proxy flattens them to bare lines. The
+  // connector reads either rather than assuming it knows which one arrived —
+  // which route a page came down is not something the parser should depend on.
+  const heads = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    const m = /^[*\-]?\s*#{3,6}\s*(.+?)\s*$/.exec(t);
+    if (m) { heads.push(stripMd(m[1])); continue; }
+    // Unmarked, but short and shaped like one of the rows we want.
+    if (t.length <= 90 && /^(price\s*:|published on|published\s+(daily|weekly|monthly)|language\s*[-:]|issues\s+\d+)/i.test(t)) {
+      heads.push(stripMd(t));
+    } else if (t.length <= 40 && parseIssueLabel(stripMd(t)).precision === 'day') {
+      heads.push(stripMd(t));
+    }
+  }
+
+  const priceRow = heads.find(h => /^price\s*:/i.test(h));
+  if (priceRow) {
+    const amt = /([\d,]+(?:\.\d+)?)/.exec(priceRow);
+    if (amt) {
+      const amount = parseFloat(amt[1].replace(/,/g, ''));
+      if (Number.isFinite(amount) && amount > 0) {
+        obs.offers.push({
+          kind: 'single', issues: 1, amount, currency: 'INR',
+          seller: 'Readwhere', format: 'digital', url: obs.url,
+        });
+      }
+    }
+  }
+
+  // "Published on Sep 4, 2026" — a real publication date, which is far better
+  // evidence than a cover date. Cover dates routinely run ahead of the day an
+  // issue reaches a shelf, and this is the only source here that states both.
+  const pub = heads.find(h => /^published on/i.test(h))
+    || (/Published on\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4})/i.exec(text) || [])[0];
+  if (pub) {
+    const d = Date.parse(String(pub).replace(/^published on\s*/i, ''));
+    if (Number.isFinite(d)) obs.publishedAt = d;
+  }
+
+  // The current issue is the dated heading that is not the price and not the
+  // publication date.
+  for (const h of heads) {
+    if (/^price\s*:/i.test(h) || /^published on/i.test(h) || /^issues\s+\d+$/i.test(h)) continue;
+    if (parseIssueLabel(h).precision !== 'none') { obs.issueLabel = h; break; }
+  }
+
+  // Cover: the issue-scoped image, never the title-scoped one, so a magazine
+  // whose masthead art is stale cannot supply a wrong-looking current cover.
+  const cover = /(https?:\/\/[^\s)"']*coverforissue\/\d+\/[a-z]+\/\d+)/i.exec(text);
+  if (cover) obs.coverUrl = cover[1];
+
+  // Previous issues, for cadence and for confirming nothing newer is listed.
+  // Readwhere puts the issue date in the URL slug of every back issue, which is
+  // route-independent — it survives markdown extraction and HTML flattening
+  // alike — so that is what is read rather than the surrounding markup.
+  const seenIssue = new Set();
+  const slugRe = /readwhere\.com\/(?:magazine|comic)\/[^/\s)"']+\/[^/\s)"']+\/([A-Za-z0-9-]+)\/(\d{5,})/g;
+  let pm;
+  while ((pm = slugRe.exec(text))) {
+    if (seenIssue.has(pm[2])) continue;
+    const label = decodeURIComponent(pm[1]).replace(/-/g, ' ').trim();
+    if (!label || parseIssueLabel(label).precision === 'none') continue;
+    seenIssue.add(pm[2]);
+    obs.recentIssues.push({
+      label,
+      cover: 'https://iacache.epapr.in/read/imageapi/coverforissue/' + pm[2] + '/magazine/300',
+      url: pm[0].startsWith('http') ? pm[0] : 'https://www.' + pm[0],
+    });
+    if (obs.recentIssues.length >= 14) break;
+  }
+  // Newest first, so recentIssues[0] means what the rest of the app assumes.
+  obs.recentIssues.sort((a, b) =>
+    (parseIssueLabel(b.label).date || 0) - (parseIssueLabel(a.label).date || 0));
+  if (!obs.issueLabel && obs.recentIssues.length) obs.issueLabel = obs.recentIssues[0].label;
+
+  // The standing description sits in the "About" block.
+  const about = lines.findIndex(l => /About Issue|About the Magazine|About Magazine/i.test(l));
+  if (about >= 0) {
+    for (let i = about + 1; i < Math.min(about + 14, lines.length); i++) {
+      const t = lines[i].trim();
+      if (t.length > 120 && !isMarkupLine(t)) { obs.magazineDescription = stripMd(t); break; }
+    }
+  }
+  if (!obs.magazineDescription) {
+    const longest = lines.map(l => l.trim())
+      .filter(l => l.length > 220 && !isMarkupLine(l))
+      .sort((a, b) => b.length - a.length)[0];
+    if (longest) obs.magazineDescription = stripMd(longest);
+  }
+
+  obs.availability = obs.issueLabel ? 'available' : 'unknown';
+  if (!obs.issueLabel) obs.problems.push('no issue label could be read from the Readwhere page');
+  return obs;
+}
 
 /* -------------------------------------------------------- publisher pages */
 /* The primary source, where one exists and will answer. A publisher's own
@@ -1121,7 +1549,10 @@ const PUBLISHER = {
   },
 };
 
-const CONNECTORS = { magzter: MAGZTER, readwhere: READWHERE, publisher: PUBLISHER, websearch: WEBSEARCH };
+const CONNECTORS = {
+  magzter: MAGZTER, readwhere: READWHERE, wikidata: WIKIDATA,
+  publisher: PUBLISHER, websearch: WEBSEARCH,
+};
 
 /* ============================================================ normalising */
 /* Observations arrive as prose. This section turns prose into the handful of
@@ -1143,7 +1574,33 @@ function parseIssueLabel(label) {
   // Ordinal suffixes are common on Indian mastheads ("August 2nd 2026"). Left
   // in, they fall through to the numbered branch, where the issue loses its
   // date and with it every freshness check.
-  const low = s.toLowerCase().replace(/(\d)(st|nd|rd|th)\b/g, '$1');
+  // Mastheads punctuate loosely — "September 14 , 2026" with a space before the
+  // comma is real Readwhere output, and it fell all the way through to the
+  // bare-year branch, losing a full cover date and the freshness check with it.
+  const low = s.toLowerCase()
+    .replace(/(\d)(st|nd|rd|th)\b/g, '$1')
+    .replace(/\s+,/g, ',')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  // Numeric dates: 04-09-2026, 28/08/2026. Day-first, which is the convention
+  // everywhere this app looks — the sources are Indian sites. Where the first
+  // number is over 12 that is certain; where both could be a month it is a
+  // convention rather than a deduction, so it is still taken as day-first but
+  // the whole label is only ever used alongside the corroborating evidence in
+  // identifyCurrentIssue().
+  // A space counts as a separator too: back-issue dates are recovered from URL
+  // slugs, so "04-09-2026" reaches here as "04 09 2026" once the slug is
+  // un-hyphenated.
+  const numeric = /^(\d{1,2})[-/. ](\d{1,2})[-/. ](\d{4})$/.exec(low);
+  if (numeric) {
+    let day = +numeric[1], mon = +numeric[2];
+    if (day <= 12 && mon > 12) { const t = day; day = mon; mon = t; }
+    if (mon >= 1 && mon <= 12 && day >= 1 && day <= 31) {
+      const yr = +numeric[3];
+      return { precision: 'day', date: Date.UTC(yr, mon - 1, day), month: yr * 12 + (mon - 1), text: s };
+    }
+  }
 
   // "September 14, 2026" / "14 September 2026" / "Sep 14 2026"
   let m = new RegExp('^' + MONTH_RE + '\\s+(\\d{1,2}),?\\s+(\\d{4})$', 'i').exec(low)
@@ -1507,6 +1964,23 @@ function identifyCurrentIssue(rec, obs) {
     }
   }
 
+  // A stated publication date beats every inference available. If a source says
+  // this issue went out four days ago, nothing about cover-date convention or
+  // cadence estimation can improve on that.
+  const published = obs.map(o => o.publishedAt).filter(Boolean).sort((a, b) => b - a)[0];
+  if (published) {
+    const sincePub = (Date.now() - published) / 864e5;
+    const cycle = (rec.frequency && rec.frequency.days) || 30;
+    if (sincePub >= -2 && sincePub <= cycle * 1.35) {
+      conf += 0.22;
+      reasons.push('the source states it was published on ' + fmtDate(published));
+    } else if (sincePub > cycle * 2.5) {
+      conf -= 0.2;
+      reasons.push('the source states it was published on ' + fmtDate(published) +
+        ', which is well over a cycle ago');
+    }
+  }
+
   if (agreeing.length > 1) {
     conf += 0.15;
     reasons.push(agreeing.length + ' independent sources give the same issue');
@@ -1536,6 +2010,7 @@ function identifyCurrentIssue(rec, obs) {
   const band = conf >= 0.75 ? 'verified' : conf >= 0.5 ? 'likely' : conf >= 0.28 ? 'uncertain' : 'unknown';
   return {
     label: best.label, parsed: best.parsed, url: best.url, source: best.source,
+    publishedAt: published || null,
     checkedAt: best.at, confidence: conf, band, reasons, claims,
     key: rec.id + '|' + (best.parsed.date || best.label),
   };
@@ -3111,7 +3586,11 @@ function rankAll(opts = {}) {
     return { rec, ...s };
   }).sort((a, b) => b.base - a.base);
 
-  const shortlistSize = opts.size || 6;
+  // A single answer plus five alternatives was too little to browse and too
+  // little to argue with. The shortlist is now long enough to read like a
+  // ranked list, with the diversity and repetition machinery applied all the way
+  // down it rather than only across the top few.
+  const shortlistSize = opts.size || 40;
   let chosen = selectShortlist(scored, t, f, shortlistSize);
 
   const explorePick = pickExploration(scored, chosen, t, f);
@@ -3325,7 +3804,7 @@ function planFetches(budget) {
     for (const c of cats.slice()) if (/newspaper/.test(c)) cats.splice(cats.indexOf(c), 1);
   }
 
-  const breadth = [];
+  let breadth = [];
   let ci = 0;
   while (breadth.length < budget && cats.length) {
     const cat = cats[ci % cats.length];
@@ -3341,6 +3820,19 @@ function planFetches(budget) {
   const hotN = Math.min(hot.length, Math.ceil(budget * 0.25));
   const staleN = Math.min(stale.length, Math.ceil(budget * 0.35));
   const breadthN = Math.max(0, budget - hotN - staleN);
+
+  // Readwhere is 150 titles against Magzter's 10,400, so a proportional
+  // round-robin would reach almost none of it — and Readwhere is the only
+  // source that quotes rupees and states a publication date, which are the two
+  // things a recommendation most needs. It gets a guaranteed slice of the
+  // breadth budget instead of competing for it on volume.
+  const rwFresh = fresh
+    .filter(l => l.sourceId === 'readwhere')
+    .sort((a, b) => (a.order ?? 1e6) - (b.order ?? 1e6))
+    .slice(0, Math.ceil(breadthN * 0.35));
+
+  const taken = new Set(rwFresh.map(l => l.id));
+  breadth = rwFresh.concat(breadth.filter(l => !taken.has(l.id))).slice(0, breadthN);
 
   return {
     plan: [].concat(
@@ -3415,7 +3907,9 @@ async function runRefresh(opts = {}) {
       const rw = await READWHERE.universe({ note });
       if (rw.stubs.length) {
         const added = mergeLeads(rw.stubs, 'readwhere');
-        note('Readwhere: ' + rw.stubs.length + ' titles (' + added + ' new)');
+        note('Readwhere: ' + rw.stubs.length + ' titles in rupees (' + added + ' new)');
+      } else {
+        note('Readwhere unavailable — ' + (rw.error || 'no response'));
       }
       done++;
     }
@@ -3453,10 +3947,14 @@ async function runRefresh(opts = {}) {
     note('Reading ' + plan.length + ' issue pages (' + counts.hot + ' to verify, '
       + counts.stale + ' stale, ' + counts.breadth + ' new)');
 
-    for (const lead of plan) {
-      if (state.abort) break;
+    // Eight at a time rather than one after another. The per-upstream limiter
+    // is still the thing that decides how fast requests actually leave, so this
+    // cannot outrun what the proxy tolerates — it just stops the refresh idling
+    // between them, which was costing a factor of five.
+    const leadIndex = new Map(state.leads.map(l => [l.id, l]));
+    await pooled(plan, CONCURRENCY, async (lead, seq) => {
       const connector = CONNECTORS[lead.sourceId] || CONNECTORS.magzter;
-      setProgress('(' + (done - 4) + '/' + plan.length + ') ' + (lead.title || lead.url));
+      setProgress('(' + seq + '/' + plan.length + ') ' + (lead.title || lead.url));
       let obs;
       try {
         obs = await connector.detail(lead);
@@ -3466,7 +3964,7 @@ async function runRefresh(opts = {}) {
       }
       done++;
 
-      const stored = state.leads.find(l => l.id === lead.id);
+      const stored = leadIndex.get(lead.id);
       if (stored) {
         stored.detailAt = Date.now();
         stored.lastResult = obs.availability;
@@ -3474,10 +3972,10 @@ async function runRefresh(opts = {}) {
         else stored.fails = 0;
       }
 
-      if (obs.availability === 'gone' && !obs.title) continue;
+      if (obs.availability === 'gone' && !obs.title) return;
       const rec = upsertObservation(obs, lead);
       if (stored) stored.recordId = rec.id;
-    }
+    });
 
     /* ---- settle ---- */
     dfCache.size = -1;                 // topic frequencies moved; force a rebuild
@@ -3703,10 +4201,32 @@ function viewMonth() {
   }
 
   if (r.alternatives.length) {
-    main.append(el('h2', { class: 'sec' }, t.empty ? 'Also on the shelf' : 'Ranked alternatives'));
+    main.append(el('h2', { class: 'sec' },
+      (t.empty ? 'The rest of the shelf' : 'Ranked shortlist')
+      + ' — ' + r.alternatives.length + ' more, in order'));
+    main.append(el('p', { class: 'muted small', style: 'margin:-6px 0 12px' },
+      t.empty
+        ? 'Ordered by how strong the issue is and how confidently it can be shown to be current, '
+          + 'and spread deliberately across subjects. Nothing here is a taste match yet.'
+        : 'Each place is decided against the ones above it, not just against you — a magazine that '
+          + 'repeats the subject of the one above loses ground to a more varied one.'));
+
     const grid = el('div', { class: 'grid' });
-    r.alternatives.forEach((c, i) => grid.append(rankCard(c, i + 2)));
+    const shown = r.alternatives.slice(0, monthListLimit);
+    shown.forEach((c, i) => grid.append(rankCard(c, i + 2)));
     main.append(grid);
+
+    if (r.alternatives.length > shown.length) {
+      main.append(el('div', { class: 'btnRow', style: 'margin-top:14px;justify-content:center' },
+        el('button', {
+          class: 'ghost',
+          onclick: () => { monthListLimit += 24; render(); },
+        }, 'Show ' + Math.min(24, r.alternatives.length - shown.length) + ' more'),
+        el('button', {
+          class: 'ghost',
+          onclick: () => setView('browse'),
+        }, 'Browse everything that clears your filters')));
+    }
   }
 
   main.append(el('h2', { class: 'sec' }, 'How this month was worked out'));
@@ -3963,6 +4483,11 @@ function viewBrowse() {
 }
 let browseQuery = '';
 let browseSort = 'score';
+
+// How much of the ranked list the month view is currently showing. Reset when
+// the month or the filters change, not on every render, so pressing "show more"
+// and then reacting to a card does not collapse the list again.
+let monthListLimit = 15;
 
 /* ---------------------------------------------------------- the taste view */
 /* Everything the app believes about the reader, what it believes it FROM, and a
@@ -5007,6 +5532,7 @@ const VIEW_HINTS = {
 };
 
 function setView(v) {
+  if (v !== state.view && v === 'month') monthListLimit = 15;
   state.view = v;
   render();
   window.scrollTo({ top: 0, behavior: 'instant' });

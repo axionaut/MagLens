@@ -1,0 +1,4 @@
+# Local-only files — not part of the public deployed app
+dev/
+.DS_Store
+*.local.json

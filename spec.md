@@ -326,3 +326,197 @@ deleting a purchase rebuilds the model (`comics 2.98 → 2.19`).
 
 **Static checks** — `node --check app.js`; every `$('#id')` in `app.js` resolves
 to an id in `index.html` (45/45).
+
+## 4. v3 — English-only, no adult material, pairwise learning, one ranked grid
+
+Six defects reported by the owner against v2. Four were real bugs, one was a
+missing control, one was a misleading number. All six are fixed; a seventh item
+(a replacement India newsstand) was attempted and abandoned, see §4.8.
+
+### 4.1 Other languages appeared under an English-only filter
+
+Two independent faults. `defaultFilters()` shipped `languages: []`, which means
+*any* language — and the gate in `evaluateFilters` read:
+
+```js
+if (rec.language && !f.languages.includes(rec.language)) fail(...)
+```
+
+so a title whose language could not be read was never rejected. Since most
+listings never declare a language, "English only" was letting most of the
+newsstand through. `normLanguage` made this worse by only script-checking the
+*title*, so Grihshobha and Saras Salil — Hindi magazines with Latin-script
+names — came back `null` and passed.
+
+Fixed on three fronts. English is now the default. Detection reads, in falling
+order of authority: the declared language, the title's script, **the script of
+the issue text** (12+ characters in one range), a language named outright in the
+title or shelf, and a romanised-Indic title list (`INDIC_TITLE_CUES`). The basis
+is stored on the record as `languageBasis`, so a heuristic match is never
+presented as a declaration. Unknown-language titles are now rejected when the
+title is not Latin script (`nonLatinTitle`), with a `filters.unknownLanguage`
+control offering `strict` for anyone who wants the harder line.
+
+### 4.2 Pornography could not be excluded
+
+There was no control. `ADULT_CUES` mixed erotica with `liquor`, `whisky`,
+`cocktail` and `lingerie`, and its only effect was to set `content.audience =
+'adult'` — which is equally true of a defence quarterly. The `audience` filter
+selected *for* that bucket and could not select against it.
+
+`EXPLICIT_CUES`, `EXPLICIT_TITLE_CUES` and `EXPLICIT_CATEGORIES` are now a
+separate question answered by three independent signals: the shelf a title is
+filed on, its name, and its issue text. Shelf and title are decisive alone; body
+text needs three hits, because one word in a book review is not a porn magazine.
+`filters.hideExplicit` defaults true. Food, drink and fashion titles are
+deliberately untouched — the owner's decision, recorded here because the wider
+reading of the cue list was offered and declined.
+
+### 4.3 Like and dislike changed nothing
+
+The most serious of the six, and it was backwards: **a title scoring a perfect
+1.00 on preference fit finished 8th, below seven titles the model knew nothing
+about.** Measured on a 12-magazine synthetic corpus after two likes and two
+dislikes, with topic utilities correctly learned at `travel=+2.06`,
+`food=+1.87`, `finance=-2.20`:
+
+```
+Travel Diaries  base=4.98          Cricket Weekly  base=6.04  (zero signal)
+  prefFit     1.000 x  2.6 =  2.600   prefFit     0.877 x  2.6 =  2.279
+  novelty     0.214 x  0.5 =  0.107   novelty     1.000 x  0.5 =  0.500
+  exploration 0.566 x  0.5 =  0.283   exploration 1.000 x  0.5 =  0.500
+  repetition  1.000 x -1.3 = -1.300   repetition  (none)
+```
+
+Three compounding causes:
+
+1. **`like` fed the subject cool-off.** `historyContext` listed `like` beside
+   `buy` and `alreadyRead` when building `subjectMonths`, so liking a travel
+   magazine marked travel as *just read* and fired the full `-1.3` repetition
+   penalty on every travel title. The one button asking for more of a subject
+   was the button burying it. The cool-off now counts consumption only.
+2. **`novelty` rewards mismatch by construction.** A title that fits your taste
+   is close to the centroid, so it scores near zero where an unrelated one
+   scores 1.0 — a 0.39-point handicap for being right.
+3. **`exploration` does the same**, for the same reason, costing another 0.22.
+
+Net: a perfect match started 1.89 points behind a magazine with no signal.
+
+Novelty and exploration are cold-start terms and are now scaled by
+`1 - 0.75 * maturity`. That alone was not enough — at one event maturity is
+0.16, so the scaling is negligible and an upvoted title still placed outside the
+top four. Added `WEIGHTS.voted` (1.9): a vote is an instruction about *one
+magazine*, not evidence about a genre, and must move that magazine on its own.
+Both cold-start terms are zeroed outright for a voted record, since a title the
+user has judged is not unknown territory. Verified: upvoting takes a title to #1
+at 98%, and clearing the vote returns the ranking to exactly its prior order.
+
+### 4.4 Learning is now a pairwise choice
+
+Owner's design: *"It should show me two magazines and ask which one I prefer.
+That's how it learns. Simple."*
+
+`applyPair` records only the **difference** between the two records. Everything
+they share cancels: if both are English monthlies the choice says nothing about
+English or about monthlies and nothing is stored against them. Topics move on
+`share_winner - share_loser`; facets are recorded only where the pair disagrees;
+scalars take the winner's value as target and the loser's as repulsion, and only
+when the gap clears a floor (0.12, or ₹40 on price).
+
+This is structurally immune to the failure §2.3 papered over with
+`discriminativeness`: a value carried by four titles in five cannot accumulate
+evidence here, because it sits on both sides of nearly every pair.
+
+`prefer` carries weight 2.6 — above `rate`, below `buy`. It is stored as one
+event on the winner naming the loser, not as a like plus a dislike, because it
+is one judgement: the loser was not called bad, only second.
+
+`pickComparison` draws the pair. Per the owner's follow-up — *"between any two
+random magazines, not necessarily from same genre"* — contrast carries the
+largest term (2.0), same-shelf pairs are penalised, and the random term is
+deliberately large (1.6) so the question feels drawn from the whole newsstand
+rather than optimised. Information gain shapes the draw; it does not determine
+it. Measured topic overlap across five consecutive generated pairs: 0.00 every
+time. Both sides must clear availability and freshness bars — asking someone to
+choose between two magazines they would never buy produces an answer, and the
+answer is noise.
+
+### 4.5 Up/down voting in the ranked list
+
+Owner's request: ranker.com-style voting that adjusts and learns. Every card
+carries up and down arrows. A vote is a **position, not a tally**: `setVote`
+deletes any standing like/dislike before recording the new one, and pressing the
+active arrow clears it. Clearing deletes the event rather than patching the
+model, so what comes back is exactly the model that would have existed had the
+vote never been cast — the same honesty rule as the Taste view overrides in
+§1.8. Verified by round trip: 50% → 100% → 50%.
+
+### 4.6 The hero card is gone
+
+v2 rendered one large `pickCard` plus a row of small `rankCard`s. That asserts a
+confidence the ranking does not have, and the owner asked for the CineLens
+treatment instead: one uniform `auto-fill` grid, every magazine in the same
+frame, cover, rank badge, **match percentage**, topic chips, vote arrows.
+
+The match badge is `fit.score` alone — the preference-fit term, not the total.
+The total mixes in availability and freshness, which are facts about the shop
+rather than about the reader, and a number labelled "match" has to mean what it
+says. With an empty model every card reads 50% and the copy says so.
+
+`whyBox`, `whereBox` and `uncertaintyBox` were not deleted with the hero; they
+moved into the detail modal, which is where someone asking "why this one?"
+actually goes. `pickCard` is removed.
+
+### 4.7 "10,406 titles on sale in India" was misleading
+
+The owner doubted the number, and doubted issues were being counted as titles.
+The second concern was unfounded — the sitemap regex requires a token boundary
+after the third path segment, so four-segment issue URLs never match; confirmed
+directly against sample URLs. Three other things inflated it:
+
+- leads deduplicate on **URL**, so one title under two category paths counts twice;
+- academic journals and coursebooks (a large share of the Magzter India store)
+  counted as magazines;
+- languages the reader cannot read counted as if they were on offer.
+
+`leadStats()` now reports raw listings, distinct titles after canonical-title
+deduplication, and consumer magazines after dropping journals, newspapers and —
+when the filter is on — adult shelves. The header reads "*N* consumer magazines
+indexed (of *M* listings)" and the cycle summary breaks down all three. The
+hard-coded "Of 10,400 titles... about 4,500 are academic" hint in the filter
+deck is gone; it was a build-time observation presented as a standing fact.
+
+### 4.8 A replacement newsstand was attempted and abandoned
+
+The owner proposed archive.org's The Magazine Rack. Checked rather than assumed:
+654,651 items, and they are individual scanned back issues (`murzilka-1991-01`,
+`BoletinOficialTarragona_1888_115_18880516`), largely non-English and
+historical, free to read, with no price, no availability and no current issue.
+It answers a different question and would worsen both §4.1 and §4.7. Declined
+with reasons.
+
+A substitute India newsstand was then attempted. PressReader's India catalogue
+is JS-rendered — the reader proxy returns 9.8 KB of navigation chrome and no
+titles. Zinio, Magazine Mall and Indian Magazine Online all returned near-empty
+under r.jina.ai rate limiting. **No connector was written.** Shipping a parser
+against markup that could not be read is the exact mistake recorded in the
+`DIRECT_OK` comment — Readwhere was once added on the assumption it sent CORS
+headers, returned nothing in the browser, and a Node harness reported success.
+Left open deliberately.
+
+### 4.9 Migration
+
+`loadState` spreads stored filters over the defaults, so an existing profile's
+`languages: []` would win and the new English default would never arrive. A
+one-time `meta.filterVersion < 3` migration sets the three new fields only where
+the user had not already chosen, and a toast says what changed rather than
+silently altering results.
+
+### 4.10 Verification for this release
+
+Headless logic harness over the real ranking and learning code, plus a jsdom
+smoke test over the real `index.html` and `app.js`. All five views rendered with
+zero failures; the vote button and both comparison cards dispatch real clicks
+and record the expected events; 12 match badges present on a 12-title corpus.
+Lead deduplication confirmed (4 raw → 3 distinct → 2 consumer). `node --check
+app.js` and `git diff --check` clean. The owner does the browser testing.

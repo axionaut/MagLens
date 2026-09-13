@@ -15,6 +15,26 @@
    recorded interaction events and can be inspected, corrected or deleted in the
    Taste view.
 
+   It learns two ways, both of them one click:
+
+     - A PAIRWISE CHOICE, at the top of the month view: two magazines drawn from
+       opposite ends of the newsstand, "which would you rather read". This is the
+       primary signal. Everything the two share cancels out and only what makes
+       them different is recorded (applyPair), which is why a single answer
+       separates a dozen dimensions at once and why near-universal facets like
+       "English" or "Monthly" can never accumulate spurious evidence.
+
+     - UP AND DOWN ARROWS on every card in the ranked list, ranker.com style. A
+       vote is a position rather than a tally: pressing the active arrow again
+       deletes the event, so the model returns to exactly what it would have been
+       had the vote never been cast. A vote also scores the title directly
+       (WEIGHTS.voted) instead of only teaching its topics, because an
+       instruction about one magazine should move that magazine.
+
+   Hard constraints — language, price, format, and whether to show pornography —
+   are never learned and never written by the model. They live in the filter deck
+   and only the user sets them.
+
    Layering, in dependency order, each section marked with a banner below:
      util → state → persistence → net → connectors → normalise → dedupe →
      issue identification → content understanding → filters → learning →
@@ -24,7 +44,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 2;
+const APP_VERSION = 3;
 
 /* ============================================================== constants  */
 
@@ -119,6 +139,13 @@ const DEFAULT_BUDGET = 150;
 // thumb over a card that was barely read.
 const EVENT_WEIGHT = {
   buy:           3.0,
+  // A forced choice between two real magazines. Stronger than a like because it
+  // is comparative: "this one, not that one" fixes a direction, where a like
+  // only says "not nothing". See applyPair() for why that makes it cheap to
+  // learn from — everything the two share cancels out and only the differences
+  // survive, which is exactly the prevalence problem the facet damping in
+  // discriminativeness() was invented to paper over.
+  prefer:        2.6,
   rate:          2.2,
   dislike:       1.7,
   like:          1.6,
@@ -154,6 +181,14 @@ const WEIGHTS = {
   repetition:    -1.3,   // topic covered too recently
   recentTitle:   -1.6,   // this exact title recommended too recently
   ownedIssue:    -4.0,   // this exact issue already bought or already read
+  // A direct up or down vote on THIS title. Deliberately large, and deliberately
+  // separate from prefFit: a vote is an instruction about one magazine, not
+  // evidence about a genre, and it has to be able to move that magazine on its
+  // own. Without this term the arrows looked broken — an upvoted title still
+  // learned its topics, but the novelty and exploration terms then penalised it
+  // for being exactly what the user had just said they wanted, and it could
+  // finish below titles nobody had expressed any opinion about at all.
+  voted:          1.9,
 };
 
 const MONTHS = ['January','February','March','April','May','June','July',
@@ -345,7 +380,15 @@ function defaultFilters() {
   return {
     maxPrice: null,           // INR per issue; null = no ceiling
     format: 'any',            // any | print | digital
-    languages: [],            // empty = any language
+    // English by default. This is a hard constraint and a statement about what
+    // the reader can read, not a taste — an English-only reader handed a Hindi
+    // monthly has been handed nothing, however well it scores.
+    languages: ['English'],
+    // When an English-only filter is on, what to do with a title whose language
+    // could not be established. 'latin' keeps it if its name is in Latin script
+    // and flags it; 'strict' drops everything not positively identified.
+    unknownLanguage: 'latin',
+    hideExplicit: true,       // pornography and erotica, never a taste question
     frequency: [],            // empty = any cadence
     topicsWanted: [],         // empty = no constraint (NOT a seeded interest)
     topicsExcluded: [],
@@ -439,6 +482,8 @@ async function idbDel(store, key) {
 
 let memoryOnly = false;
 
+let migratedFilters = false;
+
 async function loadState() {
   const d = await db();
   memoryOnly = !d;
@@ -457,6 +502,22 @@ async function loadState() {
   if (meta) {
     Object.assign(state.meta, meta.meta || {});
     state.filters = meta.filters ? { ...defaultFilters(), ...meta.filters } : null;
+
+    // v3 added an English-only default, a strictness setting for titles whose
+    // language cannot be read, and a pornography filter. Spreading the stored
+    // filters over the defaults preserves the old values, which for `languages`
+    // means the old "any language" empty array wins and the new default never
+    // arrives. These three are therefore migrated explicitly, once, and only
+    // where the user had not already made a choice of their own.
+    if (state.filters && (state.meta.filterVersion || 0) < 3) {
+      if (!state.filters.languages || !state.filters.languages.length) {
+        state.filters.languages = ['English'];
+      }
+      if (state.filters.hideExplicit == null) state.filters.hideExplicit = true;
+      if (!state.filters.unknownLanguage) state.filters.unknownLanguage = 'latin';
+      state.meta.filterVersion = 3;
+      migratedFilters = true;
+    }
     state.overrides = meta.overrides || {};
     state.merges = meta.merges || [];
   }
@@ -1741,13 +1802,78 @@ const SCRIPT_RANGES = [
   [/[ഀ-ൿ]/, 'Malayalam'], [/[؀-ۿ]/, 'Urdu'],
 ];
 
-function normLanguage(declared, title) {
+// Romanised Indic titles are the hole every script check falls through:
+// Grihshobha, Saras Salil and Sarita are Hindi magazines written in Latin
+// letters, so SCRIPT_RANGES never fires and the language came back null — which
+// then sailed through an English-only filter, because the filter only rejected
+// languages it could name. These are title words that do not occur in English
+// magazine names and do occur constantly in Indic ones.
+const INDIC_TITLE_CUES = [
+  ['Hindi', ['grihshobha', 'saras', 'salil', 'sarita', 'kadambini', 'dharmyug', 'nandan',
+    'champak hindi', 'meri saheli', 'grehlakshmi', 'vanitha hindi', 'aha zindagi',
+    'india today hindi', 'rozgar', 'samachar', 'patrika', 'jagran', 'bhaskar',
+    'kalyan', 'manorama hindi', 'pratiyogita', 'darpan', 'gyan', 'vigyan',
+    'sarvottam', 'navneet', 'hans', 'akhand jyoti']],
+  ['Marathi', ['lokprabha', 'saptahik', 'sakal', 'maher', 'grihshobhika', 'chitralekha marathi']],
+  ['Gujarati', ['chitralekha', 'abhiyaan', 'safari', 'akila', 'navchetan', 'gujarat']],
+  ['Tamil', ['kumudam', 'vikatan', 'kalki', 'dinamalar', 'aval', 'mangayar', 'puthiya']],
+  ['Malayalam', ['manorama', 'mathrubhumi', 'vanitha', 'grihalakshmi', 'bhashaposhini', 'kalakaumudi']],
+  ['Telugu', ['swathi', 'chatura', 'navya', 'eenadu', 'sakshi', 'andhra']],
+  ['Kannada', ['taranga', 'sudha', 'mayura', 'prajavani', 'karmaveera']],
+  ['Bengali', ['anandabazar', 'desh', 'sananda', 'anandamela', 'sarodiya', 'bartaman']],
+  ['Punjabi', ['ajit', 'jagbani', 'preetlari']],
+  ['Urdu', ['urdu', 'inquilab', 'siasat', 'munsif']],
+  ['Odia', ['samaja', 'dharitri', 'sambad']],
+];
+
+// A language name as a bare word in the title or category is a direct
+// statement, and Magzter uses it constantly ("Grihshobha - Hindi").
+const LANGUAGE_WORDS = ['Hindi', 'Bengali', 'Punjabi', 'Gujarati', 'Odia', 'Oriya', 'Tamil',
+  'Telugu', 'Kannada', 'Malayalam', 'Urdu', 'Marathi', 'Assamese', 'Sanskrit',
+  'Nepali', 'Konkani', 'Sindhi', 'Bhojpuri', 'English'];
+
+// Detection now reads, in falling order of authority: what the source declared,
+// the script the title is written in, the script the ISSUE TEXT is written in,
+// a language named outright in the title or shelf, and finally a romanised
+// Indic title word. Everything before the last is evidence; the last is a
+// heuristic and is reported as one, which is why the basis comes back with it.
+function normLanguage(declared, title, extra = {}) {
+  const say = (lang, basis) => ({ language: lang, basis });
+
   if (declared) {
     const d = String(declared).trim();
-    if (d && !/^n\/?a$/i.test(d)) return d.charAt(0).toUpperCase() + d.slice(1);
+    if (d && !/^n\/?a$/i.test(d)) {
+      return say(d.charAt(0).toUpperCase() + d.slice(1), 'the source states it');
+    }
   }
-  for (const [re, name] of SCRIPT_RANGES) if (re.test(String(title || ''))) return name;
-  return null;
+  for (const [re, name] of SCRIPT_RANGES) {
+    if (re.test(String(title || ''))) return say(name, 'the title is written in ' + name + ' script');
+  }
+
+  // The issue's own text. A Latin-script title over Devanagari cover lines is a
+  // Hindi magazine, and this is the only place that can be seen.
+  const body = String(extra.text || '');
+  if (body) {
+    for (const [re, name] of SCRIPT_RANGES) {
+      const hits = (body.match(new RegExp(re.source, 'g')) || []).length;
+      if (hits >= 12) return say(name, name + ' script across the issue text');
+    }
+  }
+
+  const hay = (String(title || '') + ' ' + String(extra.category || '')).toLowerCase();
+  for (const w of LANGUAGE_WORDS) {
+    const re = new RegExp('(^|[^a-z])' + w.toLowerCase() + '($|[^a-z])');
+    if (re.test(hay)) return say(w === 'Oriya' ? 'Odia' : w, 'named in the title or shelf');
+  }
+
+  for (const [name, cues] of INDIC_TITLE_CUES) {
+    for (const cue of cues) {
+      const re = new RegExp('(^|[^a-z])' + escapeRe(cue) + '($|[^a-z])');
+      if (re.test(hay)) return say(name, 'the title reads as a ' + name + ' one');
+    }
+  }
+
+  return say(null, 'nothing on the page names a language');
 }
 
 /* =============================================================== records  */
@@ -1828,7 +1954,21 @@ function rebuildRecord(rec) {
   rec.category = rec.manual.category || (catP && catP.value) || null;
 
   const langP = pick('language');
-  rec.language = rec.manual.language || normLanguage(langP && langP.value, rec.title);
+  // Everything readable about this title, so a Latin-script name over
+  // Devanagari cover lines is still recognised as Hindi.
+  const langText = obs.map(o => [
+    o.issueDescription || '', o.magazineDescription || '',
+    (o.toc || []).map(t => (t.title || '') + ' ' + (t.blurb || '')).join(' '),
+    (o.recentIssues || []).map(r => r.label || '').join(' '),
+  ].join(' ')).join(' ').slice(0, 6000);
+  if (rec.manual.language) {
+    rec.language = rec.manual.language;
+    rec.languageBasis = 'you set it by hand';
+  } else {
+    const det = normLanguage(langP && langP.value, rec.title, { text: langText, category: rec.category });
+    rec.language = det.language;
+    rec.languageBasis = det.basis;
+  }
 
   rec.formats = uniq(obs.flatMap(o => o.formats || []));
   if (rec.manual.formats) rec.formats = rec.manual.formats;
@@ -2275,6 +2415,29 @@ const CHILD_CUES = ['for kids', 'for children', 'for young readers', 'young read
   'little readers', 'for schoolchildren'];
 const ADULT_CUES = ['erotic', 'adults only', 'explicit', 'nude', 'sexual', '18+',
   'liquor', 'whisky', 'cocktail', 'gambling', 'betting', 'lingerie'];
+
+// Pornography and erotica, kept strictly apart from ADULT_CUES above. The two
+// were the same list, which meant a cocktail recipe and a porn magazine landed
+// in the same bucket — and since that bucket was only ever used to set
+// `audience: 'adult'`, there was no way to exclude the second without also
+// excluding The Economist. These cues exist to answer one question only: is
+// this magazine pornography. A whisky column is not.
+const EXPLICIT_CUES = ['erotic', 'erotica', 'pornographic', 'pornography', 'porn ',
+  'nude', 'nudes', 'nudity', 'naked', 'topless', 'centerfold', 'centrefold',
+  'playmate', 'pin-up', 'pinup', 'escort', 'fetish', 'bdsm', 'kink',
+  'xxx', 'hardcore', 'softcore', 'adult entertainment', 'adults only',
+  'sexually explicit', 'explicit content', 'uncensored', 'boudoir'];
+
+// Strong enough on their own: a title containing one of these is pornography
+// whatever the body text says, and a body-text cue count can be fooled by a
+// single stray word in a book review.
+const EXPLICIT_TITLE_CUES = ['playboy', 'penthouse', 'hustler', 'maxim', 'fhm',
+  'erotic', 'erotica', 'nude', 'naked', 'porn', 'xxx', 'fetish', 'kink',
+  'escort', 'boudoir', 'seduction', 'sensual'];
+
+// Magzter files these shelves; none of them is a magazine anyone means when
+// they ask what to read this month.
+const EXPLICIT_CATEGORIES = /adult|erotic|men'?s\s*(interest|lifestyle)?\s*adult|18\+/i;
 const MATURE_CUES = ['murder', 'rape', 'violence', 'corruption scandal', 'terror',
   'insurgency', 'assassination', 'drug cartel', 'sexual assault', 'suicide'];
 
@@ -2290,6 +2453,8 @@ const ACADEMIC_CUES = ['journal', 'peer reviewed', 'peer-reviewed', 'issn', 'abs
 // Words too common across a newsstand to distinguish anything. Mined topics are
 // checked against this before they are allowed to become tags.
 const STOP = new Set(('the a an and or of for in on at to from with by is are was were be been this that these those it its as but not you your our their his her they we i he she what which who when where how why all any both each more most other some such only own same so than too very can will just now new latest issue magazine special cover story feature article read time mins min india indian also into over after before while about their there here get got make made take took come came go went see saw know knew think thought say said tell told give gave find found use used work works year years month months week weeks day days first last next best top great good big small long short high low right left much many well back down out up off then them him us me my no nor did does do doing done has have had having would could should may might must shall let per via etc vs plus').split(' '));
+
+function escapeRe(t) { return String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 function tokenize(text) {
   return String(text || '').toLowerCase()
@@ -2518,12 +2683,39 @@ function analyseContent(rec, obs) {
     audienceWhy = 'not enough was read about this issue to say';
   }
 
+  /* ---- pornography ---- */
+  // A separate question from `audience`, and the reason it is separate is that
+  // audience could only ever say "adult", which is equally true of a defence
+  // quarterly. Three independent signals, because any one alone is wrong: the
+  // shelf Magzter files it on, the title, and the issue text. The title and the
+  // shelf are decisive on their own; body-text cues need corroboration, since a
+  // single word in a book review is not a porn magazine.
+  const explicitTitle = EXPLICIT_TITLE_CUES.filter(c => {
+    const re = new RegExp('(^|[^a-z])' + escapeRe(c) + '($|[^a-z])', 'i');
+    return re.test(String(rec.title || ''));
+  });
+  const explicitShelf = EXPLICIT_CATEGORIES.test(String(rec.category || ''));
+  const explicitText = countCues(EXPLICIT_CUES);
+
+  let explicit = false, explicitWhy = null;
+  if (explicitTitle.length) {
+    explicit = true;
+    explicitWhy = 'the title itself (' + explicitTitle.join(', ') + ')';
+  } else if (explicitShelf) {
+    explicit = true;
+    explicitWhy = 'filed on an adult shelf (' + rec.category + ')';
+  } else if (explicitText >= 3) {
+    explicit = true;
+    explicitWhy = explicitText + ' explicit references in the issue text';
+  }
+
   /* ---- a description of THIS issue ---- */
   const summary = buildIssueSummary(rec, src, weighted);
 
   return {
     topics: weighted, evidence, minedRaw, mined: Object.fromEntries(minedTop),
     newsiness, visualness, visualBasis, visualConfidence, difficulty, audience, audienceWhy,
+    explicit, explicitWhy,
     avgMins, articleCount: src.toc.length,
     summary,
     // Most titles never publish a per-article index — only Magzter's "Stories"
@@ -2581,6 +2773,13 @@ const audienceWord = a => a === 'child' ? 'For children' : a === 'adult' ? 'For 
 
    Failing a filter removes a candidate. It does not reduce its score. */
 
+// A title carrying any non-Latin letter is not an English magazine, whatever
+// the page failed to declare. Deliberately not the same test as SCRIPT_RANGES:
+// this catches every script at once, including ones with no entry there.
+function nonLatinTitle(title) {
+  return /[^ -ɏ -⁯₠-⃏]/.test(String(title || ''));
+}
+
 function evaluateFilters(rec, f) {
   const fails = [];
   const fail = (filter, reason) => fails.push({ filter, reason });
@@ -2611,10 +2810,23 @@ function evaluateFilters(rec, f) {
     }
   }
 
+  // The leak this used to have: it only rejected a language it could NAME, so
+  // every title whose language could not be read passed an English-only filter
+  // untouched. Most titles have no declared language, so "English only" was
+  // quietly letting most of the newsstand through.
   if (f.languages.length) {
-    if (rec.language && !f.languages.includes(rec.language)) {
-      fail('language', 'published in ' + rec.language);
+    if (rec.language) {
+      if (!f.languages.includes(rec.language)) fail('language', 'published in ' + rec.language);
+    } else if (f.unknownLanguage === 'strict') {
+      fail('language', 'no language could be established for this title');
+    } else if (nonLatinTitle(rec.title)) {
+      fail('language', 'the title is not written in the Latin alphabet');
     }
+  }
+
+  const rc = rec.content || {};
+  if (f.hideExplicit && rc.explicit) {
+    fail('explicit content', rc.explicitWhy || 'reads as adult material');
   }
 
   if (f.frequency.length) {
@@ -2776,6 +2988,78 @@ function scalarView(s, label) {
 
 // The whole model, rebuilt from the log. Cheap enough to run on every change:
 // a year of heavy use is a few thousand events.
+/* -------------------------------------------------------- pairwise choice */
+/* "Which of these two?" is the cheapest honest question this app can ask, and
+   it carries more than a like does, because it fixes a DIRECTION. A like says
+   "not nothing"; a choice says "this one, not that one", and the two magazines
+   were on screen together so the comparison was real.
+
+   The whole trick is that everything the two share cancels. If both are English
+   monthlies, the choice says nothing whatever about English or about monthlies,
+   and nothing is recorded against them. Only the dimensions on which they
+   actually differ move. That is what makes this immune to the failure the facet
+   damping in discriminativeness() was invented to paper over: a value carried by
+   four titles in five can never accumulate evidence here, because it is on both
+   sides of almost every pair.                                                  */
+
+function applyPair(model, winner, loser, magnitude, evMeta) {
+  const wT = winner.topics || {}, lT = loser.topics || {};
+
+  // Topics, as a difference of shares. A topic on both cards in equal measure
+  // nets to zero; one carried only by the winner takes the full credit.
+  const names = new Set([...Object.keys(wT), ...Object.keys(lT)]);
+  for (const name of names) {
+    const delta = ((wT[name] || 0) - (lT[name] || 0)) * magnitude * 3;
+    if (Math.abs(delta) < 0.01) continue;
+    const a = accFor(model.topics, name);
+    if (delta > 0) a.pos += delta; else a.neg += -delta;
+    a.evidence.push({
+      at: evMeta.at, kind: 'prefer', sign: delta > 0 ? 1 : -1,
+      delta: +Math.abs(delta).toFixed(3),
+      recordId: delta > 0 ? winner.id : loser.id,
+      title: delta > 0 ? winner.title : loser.title,
+      against: delta > 0 ? loser.title : winner.title,
+      share: +Math.abs((wT[name] || 0) - (lT[name] || 0)).toFixed(3),
+      reason: null,
+    });
+    if (a.evidence.length > 40) a.evidence.shift();
+  }
+
+  // Facets: recorded ONLY where the pair disagrees.
+  const facetPair = (map, wKey, lKey) => {
+    if (wKey == null || lKey == null) return;
+    if (String(wKey) === String(lKey)) return;      // shared — says nothing
+    const w = accFor(map, String(wKey));
+    w.pos += magnitude;
+    w.evidence.push({ ...evMeta, note: 'chosen over ' + lKey });
+    if (w.evidence.length > 30) w.evidence.shift();
+    const l = accFor(map, String(lKey));
+    l.neg += magnitude;
+    l.evidence.push({ ...evMeta, note: 'passed over in favour of ' + wKey });
+    if (l.evidence.length > 30) l.evidence.shift();
+  };
+  const wc = winner.content || {}, lc = loser.content || {};
+  facetPair(model.audience, wc.audience, lc.audience);
+  facetPair(model.languages, winner.language, loser.language);
+  facetPair(model.publishers, winner.publisher, loser.publisher);
+  facetPair(model.frequency,
+    winner.frequency && winner.frequency.label, loser.frequency && loser.frequency.label);
+
+  // Scalars: the winner's value is the target, the loser's is the thing to
+  // avoid — but only when they are far enough apart to mean anything. Two
+  // magazines both at 0.5 visualness teach nothing about visualness.
+  const scalarPair = (key, wv, lv, minGap) => {
+    if (wv == null || lv == null) return;
+    if (Math.abs(wv - lv) < minGap) return;
+    addScalar(model[key], wv, magnitude, 1, evMeta);
+    addScalar(model[key], lv, magnitude * 0.8, -1, evMeta);
+  };
+  scalarPair('visualness', wc.visualness, lc.visualness, 0.12);
+  scalarPair('difficulty', wc.difficulty, lc.difficulty, 0.12);
+  scalarPair('newsiness', wc.newsiness, lc.newsiness, 0.12);
+  scalarPair('price', toInr(winner.price), toInr(loser.price), 40);
+}
+
 function buildTaste() {
   const model = {
     topics: {},          // name -> accumulator
@@ -2814,6 +3098,42 @@ function buildTaste() {
 
     const w = (EVENT_WEIGHT[ev.kind] || 0.2) * (ev.weightMul || 1);
     if (!w) continue;
+
+    // A pairwise choice is handled whole, by applyPair, because its meaning is
+    // in the DIFFERENCE between two records and nothing about it decomposes
+    // into "an event about one magazine".
+    if (ev.kind === 'prefer') {
+      const loser = resolveRecord(ev.loserId);
+      if (!loser || loser.id === rec.id) continue;
+      model.eventCount++;
+      model.totalWeight += w;
+      model.firstAt = model.firstAt || ev.at;
+      model.lastAt = ev.at;
+
+      const noveltyPair = centroidW ? 1 - cosine(centroid, rec.topicVec || {}) : null;
+      applyPair(model, rec, loser, w,
+        { at: ev.at, kind: 'prefer', title: rec.title, recordId: rec.id, reason: null });
+
+      // Progression reads a choice the same way it reads any acceptance: the
+      // winner was accepted at whatever distance it sat from the taste that
+      // existed at the time, and the loser was declined at its own distance.
+      if (noveltyPair != null) {
+        model.novelty.posW += w; model.novelty.posSum += noveltyPair * w;
+        const loserNov = 1 - cosine(centroid, loser.topicVec || {});
+        model.novelty.negW += w; model.novelty.negSum += loserNov * w;
+        model.novelty.samples.push({
+          at: ev.at, kind: 'prefer', title: rec.title, recordId: rec.id,
+          novelty: +noveltyPair.toFixed(3), sign: 1,
+        });
+        if (model.novelty.samples.length > 120) model.novelty.samples.shift();
+      }
+
+      for (const [k, v] of Object.entries(rec.topicVec || {})) {
+        centroid[k] = (centroid[k] || 0) + v * w;
+      }
+      centroidW += w;
+      continue;
+    }
 
     let sign = NEGATIVE_EVENTS.has(ev.kind) ? -1 : 1;
     let magnitude = w;
@@ -3086,6 +3406,113 @@ function recordEvent(kind, rec, extra = {}) {
   return ev;
 }
 
+// A pairwise choice is one event, stored on the winner with the loser named.
+// Kept as a single record rather than a like plus a dislike because it is a
+// single judgement: the user did not say the loser was bad, only that it lost.
+function recordPair(winner, loser) {
+  const ev = recordEvent('prefer', winner, {
+    loserId: loser.id,
+    loserTitle: loser.title,
+    loserIssue: (loser.issue && loser.issue.label) || null,
+    loserTopics: topEntries(loser.topics || {}, 5).map(([k]) => k),
+  });
+  return ev;
+}
+
+/* ------------------------------------------------------- choosing the pair */
+/* Which two to put up. Not the top two — those are usually near-identical and
+   the answer teaches nothing. A useful pair is one the model cannot already
+   call: close on total score, far apart on the things it is least sure about.
+
+   Both sides must be real recommendations. Asking someone to choose between two
+   magazines they would never buy produces an answer, and the answer is noise. */
+
+function pickComparison(scored, t) {
+  const pool = scored.filter(c =>
+    c.parts.availability >= 0.6 && c.parts.freshness >= 0.35 && c.parts.ownedIssue === 0);
+  if (pool.length < 2) return null;
+
+  // Recently asked pairs are not asked again, and neither is a title that has
+  // just been judged — the point is to cover new ground each time.
+  const asked = new Set(state.meta.skippedPairs || []);
+  const seenRecently = new Map();
+  for (const ev of state.events) {
+    if (ev.kind !== 'prefer') continue;
+    asked.add([ev.recordId, ev.loserId].sort().join('|'));
+    seenRecently.set(ev.recordId, ev.at);
+    seenRecently.set(ev.loserId, ev.at);
+  }
+  const now = Date.now();
+  const fatigue = id => {
+    const at = seenRecently.get(id);
+    if (!at) return 0;
+    return clamp(1 - (now - at) / (14 * 864e5));
+  };
+
+  // Deterministic per event count, so the question does not reshuffle on every
+  // render while the user is looking at it.
+  const rnd = seededRand('pair:' + state.events.length + ':' + state.magazines.size);
+  // Drawn from a wide band, not the top few. Restricting to the highest scorers
+  // would ask about the same dozen titles forever and never learn anything about
+  // the rest of the newsstand.
+  const band = pool.slice(0, Math.min(160, pool.length));
+  const top = band.length <= 60 ? band
+    : band.filter(() => rnd() < 60 / band.length).slice(0, 60);
+  if (top.length < 2) return null;
+
+  let best = null, bestGain = -Infinity;
+  for (let i = 0; i < top.length; i++) {
+    for (let j = i + 1; j < top.length; j++) {
+      const a = top[i], b = top[j];
+      if (asked.has([a.rec.id, b.rec.id].sort().join('|'))) continue;
+
+      // Close on score: the model genuinely does not know which is better. Kept
+      // deliberately light, because pushing it hard pairs a magazine with its
+      // nearest neighbour — which is usually the same subject, and a choice
+      // between two cooking monthlies teaches almost nothing.
+      const closeness = 1 - clamp(Math.abs(a.base - b.base) / 3.5);
+
+      // Far apart on content, and this is the term that matters most. The pair
+      // is drawn ACROSS the newsstand rather than within a shelf: applyPair
+      // cancels everything two magazines share, so a cross-genre pair is where
+      // nearly all the information is. Two titles from the same shelf are
+      // actively avoided.
+      const sim = cosine(a.rec.topicVec || {}, b.rec.topicVec || {});
+      const contrast = 1 - sim;
+      const sameShelf = a.rec.category && a.rec.category === b.rec.category ? 0.5 : 0;
+
+      // Weighted towards subjects the model has least evidence about.
+      const ignorance = mean([...Object.keys(a.rec.topics || {}), ...Object.keys(b.rec.topics || {})]
+        .map(k => { const tp = t.topics[k]; return tp ? 1 - tp.confidence : 1; })) || 1;
+
+      // Quality floor, so neither side is a magazine nobody would buy.
+      const quality = Math.min(a.parts.appeal, b.parts.appeal);
+
+      // The random term is large on purpose. The user asked for two magazines
+      // drawn from anywhere on the newsstand, not an optimiser's idea of the
+      // most informative pair — and a question that feels picked at random is
+      // also the one least able to walk the model into a corner of its own
+      // choosing, which is the same bubble problem that keeps `view` at weight
+      // zero. Information gain shapes the draw; it does not determine it.
+      const gain = closeness * 0.5 + contrast * 2.0 + ignorance * 0.7 + quality * 0.6
+        - sameShelf
+        - fatigue(a.rec.id) * 0.8 - fatigue(b.rec.id) * 0.8
+        + rnd() * 1.6;
+
+      if (gain > bestGain) { bestGain = gain; best = [a, b]; }
+    }
+  }
+  if (!best) return null;
+  // Left/right is randomised per pair so a habit of clicking one side cannot
+  // masquerade as a preference.
+  const flip = seededRand('side:' + best[0].rec.id + best[1].rec.id)() > 0.5;
+  return {
+    a: flip ? best[1] : best[0],
+    b: flip ? best[0] : best[1],
+    gain: bestGain,
+  };
+}
+
 function deleteEvent(id) {
   const at = state.events.findIndex(e => e.id === id);
   if (at < 0) return false;
@@ -3119,7 +3546,13 @@ function historyContext() {
     if (ev.kind === 'skip' || ev.kind === 'notInterested') {
       skipped.set(id, Math.max(skipped.get(id) || 0, ev.at));
     }
-    if (ev.kind === 'buy' || ev.kind === 'alreadyRead' || ev.kind === 'like') {
+    // CONSUMPTION only. `like` used to be in this list, which meant liking a
+    // travel magazine marked travel as "just read" and fired the full -1.3
+    // repetition penalty on every travel title — so the one button that was
+    // supposed to ask for more of a subject was the button that buried it.
+    // The cool-off exists to stop you reading the same subject twice in a
+    // month; wanting a subject is not reading it.
+    if (ev.kind === 'buy' || ev.kind === 'alreadyRead') {
       for (const t of ev.topics || []) {
         if (!subjectMonths.has(t)) subjectMonths.set(t, []);
         subjectMonths.get(t).push(ev.month);
@@ -3144,7 +3577,17 @@ function historyContext() {
     }
   }
 
-  return { boughtByRecord, readByRecord, recommendedAt, subjectMonths, skipped };
+  // The standing vote per title: the last of a like/dislike pair to be cast,
+  // since setVote() clears the previous one before recording a new one.
+  const votes = new Map();
+  for (const ev of state.events) {
+    const rec = resolveRecord(ev.recordId);
+    const id = rec ? rec.id : ev.recordId;
+    if (ev.kind === 'like') votes.set(id, 1);
+    else if (ev.kind === 'dislike') votes.set(id, -1);
+  }
+
+  return { boughtByRecord, readByRecord, recommendedAt, subjectMonths, skipped, votes };
 }
 
 /* =============================================================== ranking  */
@@ -3284,6 +3727,23 @@ function scoreCandidate(rec, t, ctx, f) {
     ? 'you have given almost no signal about these subjects'
     : 'these subjects are well covered by your history';
 
+  /* ---- a direct vote on this title ---- */
+  const vote = ctx.votes.get(rec.id) || 0;
+  parts.voted = vote;
+  notes.voted = vote > 0 ? 'you voted this up'
+    : vote < 0 ? 'you voted this down' : 'no vote either way';
+
+  // Novelty and exploration measure how little is known about something. A
+  // title the user has voted on is not unknown, so neither term applies to it —
+  // and leaving them in is what let an upvoted magazine be out-scored by one
+  // nobody had an opinion about.
+  if (vote !== 0) {
+    parts.novelty = 0;
+    parts.exploration = 0;
+    notes.novelty = 'you have judged this title directly, so unfamiliarity is not in question';
+    notes.exploration = notes.novelty;
+  }
+
   /* ---- penalties from history ---- */
   const month = nowMonth();
   const lastRec = ctx.recommendedAt.get(rec.id);
@@ -3314,6 +3774,23 @@ function scoreCandidate(rec, t, ctx, f) {
   // chosen — so it is filled in during selection and left at zero here.
   parts.diversity = 0;
   notes.diversity = '';
+
+  // Novelty and exploration are COLD-START terms and are now scaled down as the
+  // model learns. Left at full weight they did the opposite of their job: a
+  // magazine that matches your taste has low novelty by definition and low
+  // exploration value by definition, so between them they handed an unrelated
+  // magazine a ~0.6 head start over a perfect match. Measured on a synthetic
+  // corpus, a title scoring a perfect 1.00 on preference fit still finished
+  // below seven titles the model knew nothing about. They are worth a lot when
+  // nothing is known and very little once something is, which is exactly what
+  // maturity measures.
+  const coldStart = vote !== 0 ? 0 : 1 - 0.75 * (t.maturity || 0);
+  parts.novelty *= coldStart;
+  parts.exploration *= coldStart;
+  notes.novelty += t.maturity > 0.15
+    ? ' · weighted x' + coldStart.toFixed(2) + ' — the model has learned enough that fit matters more than unfamiliarity'
+    : '';
+  notes.exploration += t.maturity > 0.15 ? ' · weighted x' + coldStart.toFixed(2) : '';
 
   const base = sum(Object.entries(parts).map(([k, v]) => (WEIGHTS[k] || 0) * v));
   return { parts, notes, base, score: base, fit };
@@ -3638,6 +4115,7 @@ function comparison(better, worse) {
     repetition: 'repeats your recent subjects less',
     recentTitle: 'has not been recommended as recently',
     ownedIssue: 'is not an issue you already have',
+    voted: 'you voted it up',
   };
   return {
     against: worse.rec.title,
@@ -4177,9 +4655,8 @@ function viewMonth() {
   const r = currentCycle();
   const t = r.t;
 
-  main.append(el('h2', { class: 'sec' }, 'Which magazine should I buy this month?'));
-
-  if (!r.primary) {
+  if (!r.chosen.length) {
+    main.append(el('h2', { class: 'sec' }, 'Which magazine should I buy this month?'));
     main.append(el('div', { class: 'empty' },
       el('h3', {}, 'Nothing clears your filters this month'),
       el('p', {}, r.excluded.length + ' discovered titles were all excluded. The commonest reasons are '
@@ -4189,79 +4666,42 @@ function viewMonth() {
     return;
   }
 
-  main.append(pickCard(r.primary, r));
+  // The comparison comes first, because it is the thing that makes everything
+  // below it better and it costs one click.
+  const cmp = comparePanel(r);
+  if (cmp) main.append(cmp);
 
-  if (t.empty) {
-    main.append(el('div', { class: 'panel', style: 'margin-top:14px' },
-      el('h3', {}, 'This is not a personalised recommendation yet'),
-      el('p', {}, 'MagLens has recorded nothing about your tastes, so it has not pretended to have any. '
-        + 'The shortlist below is chosen for BREADTH — the widest spread of subjects, formats and reading '
-        + 'levels that clears the filters you set — rather than for fit. Buy something, rate something, or '
-        + 'say what you are not interested in, and the next month’s ranking will be built on that instead.')));
-  }
+  main.append(el('h2', { class: 'sec' },
+    t.empty ? 'Every magazine on sale now, ranked' : 'Ranked for you'));
+  main.append(el('p', { class: 'muted small', style: 'margin:-6px 0 14px' },
+    t.empty
+      ? 'MagLens has learned nothing about you yet, so this is not a personalised order — it is ranked '
+        + 'by how strong each issue is and how confidently it can be shown to be on sale now, spread '
+        + 'deliberately across subjects. Answer the question above and it becomes personal.'
+      : 'Ranked by how well each fits what you have taught it, then spread so the list does not repeat '
+        + 'itself. The percentage is the taste match alone. Use ▲ and ▼ on any card to correct it — '
+        + 'the list re-ranks immediately.'));
 
-  if (r.alternatives.length) {
-    main.append(el('h2', { class: 'sec' },
-      (t.empty ? 'The rest of the shelf' : 'Ranked shortlist')
-      + ' — ' + r.alternatives.length + ' more, in order'));
-    main.append(el('p', { class: 'muted small', style: 'margin:-6px 0 12px' },
-      t.empty
-        ? 'Ordered by how strong the issue is and how confidently it can be shown to be current, '
-          + 'and spread deliberately across subjects. Nothing here is a taste match yet.'
-        : 'Each place is decided against the ones above it, not just against you — a magazine that '
-          + 'repeats the subject of the one above loses ground to a more varied one.'));
+  const grid = el('div', { class: 'grid' });
+  const shown = r.chosen.slice(0, monthListLimit);
+  shown.forEach((c, i) => grid.append(rankCard(c, i + 1)));
+  main.append(grid);
+  for (const c of shown.slice(0, 3)) markViewed(c.rec);
 
-    const grid = el('div', { class: 'grid' });
-    const shown = r.alternatives.slice(0, monthListLimit);
-    shown.forEach((c, i) => grid.append(rankCard(c, i + 2)));
-    main.append(grid);
-
-    if (r.alternatives.length > shown.length) {
-      main.append(el('div', { class: 'btnRow', style: 'margin-top:14px;justify-content:center' },
-        el('button', {
-          class: 'ghost',
-          onclick: () => { monthListLimit += 24; render(); },
-        }, 'Show ' + Math.min(24, r.alternatives.length - shown.length) + ' more'),
-        el('button', {
-          class: 'ghost',
-          onclick: () => setView('browse'),
-        }, 'Browse everything that clears your filters')));
-    }
+  if (r.chosen.length > shown.length) {
+    main.append(el('div', { class: 'btnRow', style: 'margin-top:16px;justify-content:center' },
+      el('button', {
+        class: 'ghost',
+        onclick: () => { monthListLimit += 24; render(); },
+      }, 'Show ' + Math.min(24, r.chosen.length - shown.length) + ' more'),
+      el('button', {
+        class: 'ghost',
+        onclick: () => setView('browse'),
+      }, 'Browse everything that clears your filters')));
   }
 
   main.append(el('h2', { class: 'sec' }, 'How this month was worked out'));
   main.append(cycleSummary(r));
-}
-
-function pickCard(cand, r) {
-  const rec = cand.rec;
-  const card = el('div', { class: 'pick' + (cand.exploratory ? ' exploratory' : '') });
-
-  card.append(el('div', { class: 'pickCover' }, coverNode(rec)));
-
-  const main = el('div', { class: 'pickMain' });
-  main.append(el('div', { class: 'kicker' },
-    cand.exploratory ? 'Exploratory pick — outside your usual' : 'This month’s pick'));
-  main.append(el('h1', {}, rec.title));
-  main.append(el('div', { class: 'pickIssue' },
-    (rec.issue && rec.issue.label) || 'issue not identified',
-    rec.publisher ? ' · ' + rec.publisher : ''));
-  main.append(factRow(rec));
-  main.append(topicChips(rec.topics));
-  main.append(el('p', { class: 'blurb' }, rec.content.summary.text));
-  main.append(el('div', { class: 'muted small' }, 'Issue description from ' + rec.content.summary.basis + '.'));
-
-  main.append(whyBox(cand, r));
-  main.append(whereBox(rec));
-  if (rec.problems.length) main.append(uncertaintyBox(rec));
-  main.append(actionRow(cand));
-
-  card.append(main);
-  // Being shown a recommendation is itself a weak signal, and it is recorded as
-  // one — but only once per issue, so leaving the tab open does not train
-  // anything.
-  markViewed(rec);
-  return card;
 }
 
 const viewedThisSession = new Set();
@@ -4276,10 +4716,12 @@ function markViewed(rec) {
 
 function whyBox(cand, r) {
   const box = el('div', { class: 'why' });
-  box.append(el('h4', {}, 'Why this one'));
+  box.append(el('h4', {}, 'Why it sits where it does'));
   const ul = el('ul', {});
 
-  const t = r.t;
+  // Callable from the detail modal, which may be opened before any ranking has
+  // been computed in this session.
+  const t = (r && r.t) || taste();
   if (t.empty) {
     ul.append(el('li', {}, 'You have not taught it anything yet, so this is ',
       el('b', {}, 'not'), ' a taste match — it is the strongest available issue that clears your filters.'));
@@ -4301,14 +4743,15 @@ function whyBox(cand, r) {
   if (cand.exploratory) ul.append(el('li', {}, el('b', {}, 'Exploratory: '), cand.exploreReason));
   box.append(ul);
 
-  if (cand.beats) {
-    box.append(el('h4', {}, 'Why it ranks above ' + cand.beats.against));
+  const rel = cand.beats || cand.below;
+  if (rel) {
+    box.append(el('h4', {}, 'Against ' + rel.against));
     const ul2 = el('ul', {});
-    for (const rsn of cand.beats.reasons) {
+    for (const rsn of rel.reasons) {
       ul2.append(el('li', {}, rsn.text, ' ',
         el('span', { class: 'muted mono' }, (rsn.delta > 0 ? '+' : '') + rsn.delta.toFixed(2))));
     }
-    if (!cand.beats.reasons.length) {
+    if (!rel.reasons.length) {
       ul2.append(el('li', {}, 'The two are within a rounding error of each other — either would do.'));
     }
     box.append(ul2);
@@ -4356,33 +4799,178 @@ function uncertaintyBox(rec) {
   return box;
 }
 
-function rankCard(cand, n) {
+/* ------------------------------------------------------------- voting */
+/* Up and down arrows on every card in the list, ranker.com style: press one and
+   the title moves, because the vote is a real training event and the list is
+   re-ranked from the model on the spot. Pressing the same arrow again clears
+   the vote rather than stacking another one — a vote is a position, not a
+   counter, and the only way to hold a position is to be able to leave it.
+   Clearing DELETES the event, which is what makes it honest: the model that
+   comes back is exactly the model that would have existed had the vote never
+   been cast. */
+
+function currentVote(rec) {
+  for (let i = state.events.length - 1; i >= 0; i--) {
+    const ev = state.events[i];
+    if (ev.recordId !== rec.id) continue;
+    if (ev.kind === 'like') return 1;
+    if (ev.kind === 'dislike') return -1;
+  }
+  return 0;
+}
+
+function setVote(rec, dir) {
+  // Drop any standing vote first, so votes never accumulate.
+  for (const ev of state.events.filter(e => e.recordId === rec.id
+      && (e.kind === 'like' || e.kind === 'dislike'))) {
+    deleteEvent(ev.id);
+  }
+  if (dir === 1) { recordEvent('like', rec); toast('Voted up — the list has been re-ranked'); }
+  else if (dir === -1) { recordEvent('dislike', rec); toast('Voted down — the list has been re-ranked'); }
+  else toast('Vote cleared');
+  render();
+}
+
+function voteBox(rec) {
+  const v = currentVote(rec);
+  const box = el('div', { class: 'vote' + (v > 0 ? ' up' : v < 0 ? ' down' : '') });
+  box.append(el('button', {
+    class: 'voteBtn' + (v > 0 ? ' on' : ''),
+    title: v > 0 ? 'Remove your upvote' : 'More like this',
+    'aria-pressed': String(v > 0),
+    onclick: e => { e.stopPropagation(); setVote(rec, v > 0 ? 0 : 1); },
+  }, '▲'));
+  box.append(el('span', { class: 'voteState' }, v > 0 ? '+1' : v < 0 ? '−1' : '·'));
+  box.append(el('button', {
+    class: 'voteBtn' + (v < 0 ? ' on' : ''),
+    title: v < 0 ? 'Remove your downvote' : 'Less like this',
+    'aria-pressed': String(v < 0),
+    onclick: e => { e.stopPropagation(); setVote(rec, v < 0 ? 0 : -1); },
+  }, '▼'));
+  return box;
+}
+
+function matchPct(cand, t) {
+  // What the card calls the "match". It is the preference-fit term and nothing
+  // else — not the total score — because the total mixes in availability and
+  // freshness, which are facts about the shop rather than about the reader, and
+  // a number labelled "match" has to mean what it says.
+  if (t.empty) return null;
+  return Math.round(clamp(cand.fit ? cand.fit.score : 0.5) * 100);
+}
+
+function rankCard(cand, n, opts = {}) {
   const rec = cand.rec;
-  const card = el('div', { class: 'card' + (cand.exploratory ? ' exploratory' : '') });
-  card.append(coverNode(rec));
-  const body = el('div', {});
-  body.append(el('div', { class: 'chipWrap', style: 'margin-bottom:6px' },
-    el('span', { class: 'rankNo' }, '#' + n),
-    cand.exploratory ? el('span', { class: 'fact', style: 'border-color:#4b3f7a;color:#b7a9ff' }, 'Exploratory') : null));
-  body.append(el('h3', {}, rec.title));
-  body.append(el('div', { class: 'sub' },
+  const t = (state.ranked && state.ranked.t) || taste();
+  const pct = matchPct(cand, t);
+  const vote = currentVote(rec);
+
+  const card = el('div', {
+    class: 'card' + (cand.exploratory ? ' exploratory' : '')
+      + (vote > 0 ? ' votedUp' : vote < 0 ? ' votedDown' : ''),
+  });
+
+  const poster = el('div', { class: 'cardPoster' });
+  poster.append(coverNode(rec));
+  poster.append(el('span', { class: 'rankBadge' }, '#' + n));
+  if (pct != null) {
+    poster.append(el('span', {
+      class: 'matchBadge' + (pct >= 70 ? ' high' : pct >= 45 ? ' mid' : ' low'),
+      title: cand.fit ? cand.fit.note : '',
+    }, pct + '%'));
+  }
+  if (cand.exploratory) poster.append(el('span', { class: 'exploreBadge' }, 'Outside your usual'));
+  card.append(poster);
+
+  const body = el('div', { class: 'cardBody' });
+  body.append(el('h3', { class: 'cardTitle', title: rec.title }, rec.title));
+  body.append(el('div', { class: 'cardMeta' },
     ((rec.issue && rec.issue.label) || 'issue unknown')
     + ' · ' + (rec.price.amount == null ? 'price unknown' : fmtPrice(rec.price))
-    + ' · ' + ((rec.formats || []).join('/') || 'format unknown')));
-  body.append(topicChips(rec.topics, { limit: 4 }));
-  body.append(el('div', { class: 'muted small', style: 'margin-top:8px' },
+    + (rec.language ? ' · ' + rec.language : '')));
+  body.append(topicChips(rec.topics, { limit: 3 }));
+  body.append(el('div', { class: 'cardWhy' },
     cand.exploratory ? cand.exploreReason
-      : (cand.below ? 'Below #' + (n - 1) + ': ' + (cand.below.reasons[0] ? cand.below.reasons[0].text : 'a hair’s breadth')
-        : cand.fit.note)));
+      : t.empty ? (rec.content.summary.text || '').slice(0, 110)
+      : (cand.fit && cand.fit.note) || 'no strong signal either way'));
+
   const foot = el('div', { class: 'cardFoot' });
-  foot.append(confidenceFact(rec));
-  foot.append(el('button', { class: 'tiny', onclick: () => openDetail(rec, cand) }, 'Details'));
-  foot.append(el('button', { class: 'tiny', onclick: () => { recordEvent('like', rec); render(); } }, '👍'));
-  foot.append(el('button', { class: 'tiny', onclick: () => { recordEvent('dislike', rec); render(); } }, '👎'));
-  foot.append(el('button', { class: 'tiny', onclick: () => openBuy(rec) }, 'Bought'));
+  foot.append(voteBox(rec));
+  const btns = el('div', { class: 'cardBtns' });
+  btns.append(el('button', { class: 'tiny', onclick: () => openDetail(rec, cand) }, 'Details'));
+  btns.append(el('button', { class: 'tiny', onclick: () => openBuy(rec) }, 'Bought'));
+  if (!opts.noSkip) {
+    btns.append(el('button', { class: 'tiny ghost', onclick: () => openReject(rec, 'notInterested') }, 'Not for me'));
+  }
+  foot.append(btns);
   body.append(foot);
   card.append(body);
   return card;
+}
+
+/* --------------------------------------------------- the comparison panel */
+/* The primary way this app learns. Two magazines, one question, no scale to
+   interpret and nothing to type. A forced choice between two things that are
+   both on sale right now is a far better signal than a rating, because it is
+   comparative and because the alternative was concrete rather than imagined.
+
+   Deliberately drawn from across the whole newsstand rather than within a
+   shelf: applyPair() cancels everything two magazines share, so a pair from the
+   same shelf teaches almost nothing while a car magazine against a cookery one
+   separates a dozen dimensions at once. */
+
+function comparePanel(r) {
+  const pair = pickComparison(r.scored, r.t);
+  if (!pair) return null;
+
+  const panel = el('section', { class: 'compare' });
+  panel.append(el('div', { class: 'compareHead' },
+    el('h2', {}, 'Which of these two would you rather read?'),
+    el('p', { class: 'muted small' },
+      r.t.empty
+        ? 'This is how MagLens learns. It knows nothing about you yet — pick whichever appeals more and the whole list below re-ranks.'
+        : 'Both are on sale now and both clear your filters. Only what makes them DIFFERENT is learned, so anything they share is ignored.')));
+
+  const row = el('div', { class: 'compareRow' });
+  for (const side of [pair.a, pair.b]) {
+    const other = side === pair.a ? pair.b : pair.a;
+    const opt = el('button', {
+      class: 'compareCard',
+      onclick: () => {
+        recordPair(side.rec, other.rec);
+        toast('Learned: ' + side.rec.title + ' over ' + other.rec.title);
+        render();
+      },
+    });
+    opt.append(el('div', { class: 'compareCover' }, coverNode(side.rec)));
+    opt.append(el('div', { class: 'compareName' }, side.rec.title));
+    opt.append(el('div', { class: 'compareMeta' },
+      ((side.rec.issue && side.rec.issue.label) || 'issue unknown')
+      + (side.rec.price.amount == null ? '' : ' · ' + fmtPrice(side.rec.price))));
+    opt.append(topicChips(side.rec.topics, { limit: 3 }));
+    opt.append(el('div', { class: 'compareBlurb' },
+      (side.rec.content.summary.text || '').slice(0, 150)));
+    opt.append(el('span', { class: 'comparePick' }, 'Choose this'));
+    row.append(opt);
+  }
+  panel.append(row);
+
+  panel.append(el('div', { class: 'compareFoot' },
+    el('button', {
+      class: 'ghost',
+      onclick: () => {
+        // A skipped pair is recorded so the same question is not asked again,
+        // but it trains nothing — "I cannot choose" is not a preference.
+        state.meta.skippedPairs = state.meta.skippedPairs || [];
+        state.meta.skippedPairs.push([pair.a.rec.id, pair.b.rec.id].sort().join('|'));
+        scheduleSave();
+        render();
+      },
+    }, 'Skip — can’t say'),
+    el('span', { class: 'muted small' },
+      r.t.empty ? 'Nothing is recorded until you choose.'
+        : r.t.eventCount + ' judgements so far · model maturity ' + Math.round(r.t.maturity * 100) + '%')));
+  return panel;
 }
 
 function cycleSummary(r) {
@@ -4396,8 +4984,14 @@ function cycleSummary(r) {
     + 'because it went up in price, repeated itself, or could not be confirmed as current.'));
   const dl = el('dl', { class: 'kv' });
   const kv = (k, v) => { dl.append(el('dt', {}, k), el('dd', {}, v)); };
-  kv('Titles known to exist', String(state.leads.length));
-  kv('Titles actually read', researched + ' (' + (state.leads.length ? Math.round(researched / state.leads.length * 100) : 0) + '% coverage)');
+  const ls = leadStats();
+  kv('Listings emitted by the sitemaps', ls.raw.toLocaleString('en-IN'));
+  kv('Distinct titles after deduplication', ls.distinct.toLocaleString('en-IN')
+    + (ls.raw > ls.distinct ? ' (' + (ls.raw - ls.distinct).toLocaleString('en-IN')
+      + ' were the same title on a second shelf)' : ''));
+  kv('Consumer magazines among them', ls.consumer.toLocaleString('en-IN')
+    + ' — ' + ls.journals.toLocaleString('en-IN') + ' academic/coursebook titles excluded');
+  kv('Issues actually read', researched + ' (' + (ls.consumer ? Math.round(researched / ls.consumer * 100) : 0) + '% of the consumer shelf)');
   kv('Cleared your filters', String(r.scored.length));
   kv('Excluded', String(r.excluded.length));
   kv('Last refresh', state.meta.lastRefresh ? ago(state.meta.lastRefresh) + ' (' + (state.meta.lastRefreshSeconds || 0) + 's)' : 'never');
@@ -5129,8 +5723,18 @@ function openDetail(rec, cand) {
     + (rec.category ? ' · ' + rec.category : '')));
   info.append(factRow(rec));
   info.append(topicChips(rec.topics, { limit: 12 }));
+  info.append(voteBox(rec));
   head.append(info);
   body.append(head);
+
+  // The reasoning, the where-to-buy and the caveats used to live on the hero
+  // card at the top of the month view. The hero is gone — every magazine is a
+  // card in one ranked grid now — so they live here, which is where someone
+  // asking "why this one?" actually goes.
+  if (cand) body.append(whyBox(cand, state.ranked || {}));
+  body.append(whereBox(rec));
+  if (rec.problems.length) body.append(uncertaintyBox(rec));
+  if (cand) body.append(actionRow(cand));
 
   body.append(el('h2', { class: 'sec' }, 'This issue'));
   body.append(el('p', { class: 'blurb' }, rec.content.summary.text));
@@ -5322,7 +5926,23 @@ function renderDeck(target, opts = {}) {
     'Digital newsstands are far easier to read reliably than print listings, so "print only" will show fewer titles.'));
 
   target.append(multiSelect('Languages', facets.languages, f.languages, v => set('languages', v),
-    'Nothing selected means any language.'));
+    'Nothing selected means any language. English is set by default — this is a hard '
+    + 'constraint about what you can read, not a taste.'));
+
+  target.append(selectField('Titles whose language cannot be established', [
+    ['latin', 'Keep them if the title is in the Latin alphabet'],
+    ['strict', 'Drop anything not positively identified'],
+  ], f.unknownLanguage, v => set('unknownLanguage', v),
+    'Most listings never declare a language. "Keep" reads the script of the title and of the '
+    + 'issue text before giving up; "drop" is cleaner but will hide real English titles whose '
+    + 'page simply did not say so. Research → Sources reports how many are affected.'));
+
+  target.append(selectField('Adult material', [
+    [true, 'Hide pornography and erotica'], [false, 'Show everything'],
+  ], f.hideExplicit, v => set('hideExplicit', v === 'true'),
+    'Judged from the shelf a title is filed on, its name, and its issue text. This is separate '
+    + 'from "Audience" below, which only says whether a magazine is written for adults — a '
+    + 'defence quarterly is written for adults too.'));
 
   target.append(multiSelect('Frequency', facets.freqs, f.frequency, v => set('frequency', v),
     'Nothing selected means any cadence.'));
@@ -5359,7 +5979,8 @@ function renderDeck(target, opts = {}) {
   target.append(multiSelect('Publication type', [
     ['magazine', 0], ['newspaper', 0], ['journal', 0], ['book', 0],
   ], f.kinds, v => set('kinds', v),
-    'Of 10,400 titles on sale in India, about 4,500 are academic and 1,300 are newspapers. Magazines only, by default.'));
+    'Most of what the sitemaps list is not a consumer magazine — a large share is academic '
+    + 'journals and coursebooks. Magazines only, by default.'));
 
   target.append(numberField('Do not repeat a title bought within (months)', f.excludeRecentlyBought,
     v => set('excludeRecentlyBought', v ?? 0),
@@ -5443,9 +6064,14 @@ function showOnboarding() {
     ['both', 'Must suit a child and an adult'], ['adult', 'Adults only'],
   ], f.audience, v => set('audience', v)));
   grid.append(selectField('Language', [
-    ['any', 'Any language'], ['English', 'English only'],
+    ['English', 'English only'], ['any', 'Any language'],
   ], f.languages.length ? 'English' : 'any',
-    v => set('languages', v === 'any' ? [] : [v])));
+    v => set('languages', v === 'any' ? [] : [v]),
+    'English by default. A magazine you cannot read is not a recommendation.'));
+
+  grid.append(selectField('Adult material', [
+    [true, 'Hide pornography and erotica'], [false, 'Show everything'],
+  ], f.hideExplicit, v => set('hideExplicit', v === 'true')));
 
   openModal('#onboardModal');
 }
@@ -5563,10 +6189,38 @@ function render() {
   (VIEWS[state.view] || viewMonth)();
 }
 
+// How many DISTINCT consumer magazines are actually known about, as opposed to
+// how many URLs the sitemaps emitted. Three things inflated the raw number and
+// all three are corrected here: the same title listed under two category paths
+// counted twice, academic journals and coursebooks counted at all, and titles in
+// languages the reader cannot read counted as if they were on offer. Saying
+// "10,406 titles on sale in India" when most of them are neither magazines nor
+// readable is the kind of confident-sounding number this app is supposed not to
+// produce.
+function leadStats() {
+  const f = state.filters || defaultFilters();
+  const seen = new Set();
+  let consumer = 0, journals = 0;
+  for (const lead of state.leads) {
+    const cat = (lead.category || '').toLowerCase();
+    const key = canonTitle(lead.title || lead.url);
+    if (!key) continue;
+    if (seen.has(key)) continue;      // same title, second shelf
+    seen.add(key);
+    if (/academic|journal|coursebook|exam|university|research/.test(cat)) { journals++; continue; }
+    if (/newspaper/.test(cat)) continue;
+    if (f.hideExplicit && EXPLICIT_CATEGORIES.test(cat)) continue;
+    consumer++;
+  }
+  return { distinct: seen.size, consumer, journals, raw: state.leads.length };
+}
+
 function headlineText() {
   const researched = state.magazines.size;
   const bits = [];
-  bits.push(state.leads.length.toLocaleString('en-IN') + ' titles found on sale in India');
+  const ls = leadStats();
+  bits.push(ls.consumer.toLocaleString('en-IN') + ' consumer magazines indexed'
+    + (ls.raw > ls.consumer ? ' (of ' + ls.raw.toLocaleString('en-IN') + ' listings)' : ''));
   bits.push(researched.toLocaleString('en-IN') + ' issues read');
   const t = taste();
   bits.push(t.empty ? 'no tastes learned yet' : t.eventCount + ' interactions learned from');
@@ -5718,6 +6372,11 @@ async function boot() {
   if (!state.filters) state.filters = defaultFilters();
   for (const rec of state.magazines.values()) rebuildRecord(rec);
   render();
+
+  if (migratedFilters) {
+    toast('Updated: English-only and no adult material are now on by default. '
+      + 'Change either in Filters.', 6000);
+  }
 
   if (!state.meta.onboarded) {
     showOnboarding();

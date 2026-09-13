@@ -10,10 +10,16 @@ unavailable, dearer, repetitive or simply carrying a dull issue in September,
 and only a fresh read can tell you which.
 
 **It starts knowing nothing about you.** No seeded topics, no assumed interests,
-no demographic guess, no starter recommendations. The first shortlist is chosen
-for *breadth* rather than fit, and it says so on the card. Everything the app
-later believes about your taste is derived from what you actually did, is shown
-to you with the evidence behind it, and can be corrected or deleted.
+no demographic guess, no starter recommendations. The first list is ranked for
+*breadth* rather than fit, and it says so. Everything the app later believes
+about your taste is derived from what you actually did, is shown to you with the
+evidence behind it, and can be corrected or deleted.
+
+**It learns by asking you to choose.** Two magazines at a time, drawn from
+opposite ends of the newsstand: *which of these would you rather read?* Only what
+makes the two different is recorded, so anything they share is ignored. Every
+card in the ranked list below also carries up and down arrows, and pressing one
+re-ranks the list on the spot.
 
 Static: `index.html` + `styles.css` + `app.js`. No build step, no dependencies,
 no backend, no accounts, nothing paid.
@@ -149,14 +155,47 @@ Every option list is built from what has actually been discovered. There is no
 fixed menu of subjects, because a fixed menu would define what the app thinks
 magazines are about before it had read one.
 
-Two defaults worth knowing. **Magazines only**: of the 10,406 titles on sale,
-about 4,500 are academic journals and coursebooks and 1,300 are daily
-newspapers — all genuinely on sale, none of them what this question is about.
-And a magazine whose **price could not be read is never hidden** by the price
-ceiling; it is flagged on the card instead, because dropping it would silently
-hide every print title whose publisher does not put a number on the page.
+Four defaults worth knowing. **Magazines only**: much of what the newsstand
+sitemaps list is academic journals, coursebooks and daily newspapers — all
+genuinely on sale, none of them what this question is about. **English only**,
+because a magazine you cannot read is not a recommendation; a companion setting
+decides what to do with titles whose language could not be established at all.
+**No pornography or erotica**, judged from the shelf a title is filed on, its
+name and its issue text — a separate question from *Audience*, which only says
+whether a magazine is written for adults, as a defence quarterly also is. And a
+magazine whose **price could not be read is never hidden** by the price ceiling;
+it is flagged on the card instead, because dropping it would silently hide every
+print title whose publisher does not put a number on the page.
 
 ## What it learns, and how you correct it
+
+### The comparison
+
+The main way it learns. Two magazines, one question, no scale to interpret and
+nothing to type — and both of them real, on sale now, and past the same
+availability and freshness bars as anything else it would recommend.
+
+The whole trick is that **everything the two share cancels**. If both are English
+monthlies, your answer says nothing whatever about English or about monthlies and
+nothing is recorded against them. Only the dimensions on which they actually
+differ move. That is why one answer can separate a dozen things at once, and why
+a near-universal value like *English* can never accumulate spurious evidence — it
+sits on both sides of almost every pair.
+
+Pairs are drawn deliberately **across** the newsstand rather than within a shelf,
+and with a large random element. A choice between two cookery monthlies teaches
+almost nothing; a cookery monthly against a car magazine separates a dozen
+dimensions at once.
+
+### Voting
+
+Every card carries ▲ and ▼. A vote is a **position, not a tally**: pressing the
+active arrow again clears it, and clearing *deletes the event* rather than
+patching the model, so what comes back is exactly the model that would have
+existed had you never voted. A vote also scores that title directly, not only its
+subjects — an instruction about one magazine should move that magazine.
+
+### Everything else
 
 Purchases and explicit ratings dominate; a skip is worth a fifth of a like,
 because skipping is one flick of a thumb over a card that was barely read.
@@ -201,16 +240,28 @@ cautious reader as adventurous.
 
 ## Ranking
 
-Twelve components, each in [0,1], each stored on the candidate and rendered term
-by term in Research → Scores with its weight in the column header. A surprising
-ranking is traceable to the term responsible in one click.
+Thirteen components, each in [0,1], each stored on the candidate and rendered
+term by term in Research → Scores with its weight in the column header. A
+surprising ranking is traceable to the term responsible in one click.
 
 `availability · freshness · prefFit · appeal · novelty · progression · valueFit ·
-exploration` — minus `diversity · repetition · recentTitle · ownedIssue`.
+exploration · voted` — minus `diversity · repetition · recentTitle · ownedIssue`.
 
 The preference term is stretched about its neutral point in proportion to how
 much the model knows, so an informed dislike can sink an otherwise excellent
 magazine while an uninformed one cannot.
+
+`novelty` and `exploration` are **cold-start** terms and fade as the model
+matures. Both reward unfamiliarity, which a magazine that fits you lacks by
+definition — left at full weight they handed an unrelated title a head start over
+a perfect match, and a title scoring 100% on preference fit could finish below
+seven titles the model knew nothing about. Neither applies at all to a title you
+have voted on: you have judged it, so it is not unknown territory.
+
+Every magazine in the list shows a **match percentage**. That is the preference
+term alone, not the total — the total mixes in availability and freshness, which
+are facts about the shop rather than about you, and a number labelled *match* has
+to mean what it says. With an empty model every card reads 50%.
 
 Selection is separate from scoring: the second pick is not the second-best
 magazine, it is the best magazine *given* the first. Overlap costs nothing below

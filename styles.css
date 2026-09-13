@@ -263,27 +263,150 @@ h2.sec:first-child { margin-top: 0; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }
 
 /* ------------------------------------------------------------- rank cards */
+/* One uniform grid. There is no hero card: the question is "which of these
+   should I buy", and answering it with one enormous card plus a row of
+   thumbnails asserts a confidence the ranking does not have. Every magazine
+   gets the same frame, the same controls, and a visible match percentage, so
+   the list can be read down and argued with. */
 
-.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); }
+.grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  align-items: start;
+}
 
 .card {
-  display: grid; grid-template-columns: 92px 1fr; gap: 14px;
+  display: flex; flex-direction: column;
   background: var(--bg2); border: 1px solid var(--line);
-  border-radius: var(--radius); padding: 14px; align-items: start;
+  border-radius: var(--radius); overflow: hidden;
+  transition: border-color .15s, transform .15s;
 }
-.card:hover { border-color: var(--line2); }
+.card:hover { border-color: var(--line2); transform: translateY(-2px); }
 .card.exploratory { border-color: #4b3f7a; }
-.card h3 { margin: 0 0 2px; font-size: 16px; line-height: 1.25; }
-.card .sub { font-size: 12.5px; color: var(--fg3); margin-bottom: 8px; }
-.card .coverBox { width: 92px; }
-.card .coverMissing { font-size: 11px; }
+.card.votedUp { border-color: var(--accent2); }
+.card.votedDown { opacity: .62; }
+.card.votedDown:hover { opacity: 1; }
+
+.cardPoster { position: relative; background: var(--bg3); }
+.cardPoster .coverBox { width: 100%; }
+.cardPoster img { width: 100%; display: block; aspect-ratio: 3 / 4; object-fit: cover; }
+.cardPoster .coverMissing {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  aspect-ratio: 3 / 4; font-size: 11px; padding: 10px; color: var(--fg3);
+}
+
+.rankBadge {
+  position: absolute; top: 8px; left: 8px;
+  font: 700 11px/1 var(--mono); color: var(--fg);
+  background: rgba(8,10,14,.82); border: 1px solid var(--line2);
+  border-radius: 6px; padding: 4px 6px;
+}
+.matchBadge {
+  position: absolute; top: 8px; right: 8px;
+  font: 700 11px/1 var(--mono);
+  background: rgba(8,10,14,.82); border-radius: 6px; padding: 4px 6px;
+  border: 1px solid var(--line2); color: var(--fg2);
+}
+.matchBadge.high { border-color: var(--accent2); color: var(--accent2); }
+.matchBadge.mid  { border-color: #6a5326; color: var(--accent); }
+.matchBadge.low  { border-color: var(--line2); color: var(--fg3); }
+.exploreBadge {
+  position: absolute; bottom: 8px; left: 8px; right: 8px;
+  font: 600 10px/1.3 var(--sans); text-align: center;
+  background: rgba(29,26,44,.92); border: 1px solid #4b3f7a; color: #b7a9ff;
+  border-radius: 6px; padding: 4px 6px;
+}
+
+.cardBody { padding: 11px 12px 12px; display: flex; flex-direction: column; gap: 7px; flex: 1; }
+.cardTitle {
+  margin: 0; font-size: 14.5px; line-height: 1.3; font-weight: 600;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  line-clamp: 2; overflow: hidden;
+}
+.cardMeta { font-size: 11.5px; color: var(--fg3); font-family: var(--mono); }
+.cardWhy {
+  font-size: 12px; color: var(--fg2); line-height: 1.45;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  line-clamp: 3; overflow: hidden;
+}
+
+.cardFoot {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: auto; padding-top: 9px; border-top: 1px solid var(--line);
+}
+.cardBtns { display: flex; gap: 5px; flex-wrap: wrap; }
 
 .rankNo {
   font: 700 12px/1 var(--mono); color: var(--fg3);
   border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px;
 }
 
-.cardFoot { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+/* ------------------------------------------------------------------- votes */
+/* Up and down on every card. A vote is a position, not a tally, so the two
+   buttons are mutually exclusive and pressing the active one clears it. */
+
+.vote { display: inline-flex; align-items: center; gap: 2px; }
+.voteBtn {
+  font-size: 11px; line-height: 1; padding: 4px 6px; min-width: 0;
+  background: transparent; border: 1px solid var(--line); color: var(--fg3);
+  border-radius: 5px; cursor: pointer;
+}
+.voteBtn:hover { color: var(--fg); border-color: var(--line2); }
+.voteBtn.on { background: var(--accent2); border-color: var(--accent2); color: #08131a; }
+.vote.down .voteBtn.on { background: var(--bad, #c96); border-color: var(--bad, #c96); color: #1a0c0c; }
+.voteState {
+  font: 700 10px/1 var(--mono); color: var(--fg3);
+  min-width: 16px; text-align: center;
+}
+.vote.up .voteState { color: var(--accent2); }
+.vote.down .voteState { color: var(--bad, #eda1a3); }
+
+/* ------------------------------------------------------- comparison panel */
+/* The learning surface. Two magazines, one question. */
+
+.compare {
+  background: linear-gradient(160deg, #1a1f27 0%, var(--bg2) 65%);
+  border: 1px solid var(--line2); border-radius: var(--radius);
+  padding: 18px; margin-bottom: 26px;
+}
+.compareHead h2 { margin: 0 0 4px; font-size: 19px; letter-spacing: -.01em; }
+.compareHead p { margin: 0 0 14px; }
+
+.compareRow { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: stretch; }
+
+.compareCard {
+  display: flex; flex-direction: column; gap: 8px; text-align: left;
+  background: var(--bg); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 12px; cursor: pointer;
+  font: inherit; color: inherit; transition: border-color .15s, transform .15s;
+}
+.compareCard:hover, .compareCard:focus-visible {
+  border-color: var(--accent); transform: translateY(-2px);
+}
+.compareCard:hover .comparePick, .compareCard:focus-visible .comparePick {
+  background: var(--accent); color: #10131a; border-color: var(--accent);
+}
+.compareCover { width: 100%; max-width: 132px; }
+.compareCover img { width: 100%; display: block; border-radius: 8px; aspect-ratio: 3/4; object-fit: cover; }
+.compareName { font-size: 15px; font-weight: 600; line-height: 1.25; }
+.compareMeta { font: 11.5px/1.4 var(--mono); color: var(--fg3); }
+.compareBlurb { font-size: 12px; color: var(--fg2); line-height: 1.45; }
+.comparePick {
+  margin-top: auto; align-self: flex-start;
+  font-size: 12px; font-weight: 600; padding: 6px 12px;
+  border: 1px solid var(--line2); border-radius: 6px; color: var(--fg2);
+  transition: background .15s, color .15s, border-color .15s;
+}
+.compareFoot {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+}
+
+@media (max-width: 560px) {
+  .compareRow { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+  .cardWhy { -webkit-line-clamp: 2; line-clamp: 2; }
+}
 
 /* --------------------------------------------------------------- score bars */
 

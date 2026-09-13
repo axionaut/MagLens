@@ -639,3 +639,94 @@ jsdom smoke test over the real `index.html` and `app.js`, 0 failures:
 - the duel is due on an empty model, not due at 0.82 maturity after six
   answers, collapses to the invite bar, and expands again on demand;
 - all five views render.
+
+## 6. v5 — an upvote moves one place, not to the top
+
+Reported directly: *"When upvoting like ranker, why are they jumping straight to
+top?? It just means they jump one place and learns accordingly."*
+
+Correct, and v4 was wrong. `WEIGHTS.voted` gave an upvoted title a flat +1.9,
+which is a teleport. An arrow beside a ranked row does not mean "best of all",
+it means **"this one beats the one above it"** — a statement about two adjacent
+titles.
+
+### 6.1 A vote is now an adjacent pairwise comparison
+
+An upvote on rank *N* records `prefer(N over N−1)` — the same event the duel
+produces — and a downvote records `prefer(N+1 over N)`. `WEIGHTS.voted` and the
+`ctx.votes` map are gone. Pressing again compares the row with its **new**
+neighbour and walks it up another step, as repeated voting does on any ranked
+list.
+
+The toggle semantics went with it: "undo my vote" and "vote again" cannot be the
+same button. The events live in History and are individually deletable, which is
+the honest undo and the one that rebuilds the model exactly.
+
+The arrows are disabled at the top and bottom of the list, and in Browse
+whenever it is sorted by anything other than best fit — position under a price
+sort says nothing about preference, so there is nothing honest for an arrow to
+record there.
+
+### 6.2 Teaching alone moved the row the WRONG WAY
+
+The first attempt recorded only the comparison and let the list re-rank. Upvoting
+a finance magazine taught *finance*, which lifted the finance title already above
+it further still, and the voted row went **down** a place:
+
+```
+upvoting #7 (Money Matters) once...
+  now at #8      <-- moved down
+```
+
+An arrow that moves a row the wrong way is worse than one that does nothing. So a
+vote now does two things, and both are needed: it **teaches** (`applyPair`, from
+the adjacent pair) and it **asserts** a position. The assertion is `state.nudges`,
+a persisted `recordId -> score delta` map added as its own scoring term, and it
+is the same kind of object as the Taste view's `overrides` — an explicit, visible,
+reversible user correction that wins. It is shown in Research beside every other
+term and can be reset wholesale from the filter deck, which clears positions
+without un-teaching what the votes taught.
+
+### 6.3 Solve for the smallest delta, not the first one that works
+
+The delta is solved for *after* the learning is applied, against the rank the
+user was actually looking at, so the two halves cannot fight.
+
+The first solver grew the delta geometrically (×1.6) until the row passed its
+partner. That overshoots badly — the step that finally worked was several times
+larger than the one needed, and a single press carried a title from seventh to
+second. Rank is monotonic in the delta, so it is now found by **bisection**,
+which yields the minimum and therefore a one-place move. If 18 doublings cannot
+reach the target the row is pinned by a hard term such as `ownedIssue`; no
+ranking delta should override one of those, so it gives up rather than growing
+without bound.
+
+### 6.4 The duel teaches, the arrows arrange
+
+`NUDGE_WEIGHT_MUL` is 0.05 — an effective weight of 0.13, lighter than a skip.
+The value was measured rather than picked. Walking one title up the list a press
+at a time:
+
+| `NUDGE_WEIGHT_MUL` | resulting ladder |
+|---|---|
+| 0.35 | 7→6, 6→3, 3→2, 2→1 |
+| 0.12 | 7→6, 6→2, 2→1 |
+| **0.05** | **7→6, 6→5, 5→4, 4→3, 3→2** |
+
+At higher weights a press moved the row several places, because what it *taught*
+reordered the rows around it as well. An adjacent pair is similar by
+construction and carries far less information than two magazines drawn from
+opposite ends of the newsstand, so weighting it down is principled as well as
+convenient: the duel is the learning mechanism, the arrows are for tidying the
+order.
+
+Note that 0 is not the best value either — with no learning at all the ladder
+reads 7→6, 6→3, 3→1, because the `diversity` term is assigned during selection
+and reshuffles neighbours as positions change. Some learning damps that.
+
+### 6.5 Verification
+
+- an upvote from #7 lands at #6, and four successive presses give 6, 5, 4, 3;
+- the top row cannot be upvoted and the list is unchanged when tried;
+- the vote tally on the card reads +4 after four presses;
+- all five views render, and the v4 block and duel-cadence tests still pass.

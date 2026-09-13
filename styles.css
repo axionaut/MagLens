@@ -362,6 +362,7 @@ h2.sec:first-child { margin-top: 0; }
   border-radius: 5px; cursor: pointer;
 }
 .voteBtn:hover { color: var(--fg); border-color: var(--line2); }
+.voteBtn:disabled { opacity: .28; cursor: default; }
 .voteBtn.on { background: var(--accent2); border-color: var(--accent2); color: #08131a; }
 .vote.down .voteBtn.on { background: var(--bad, #c96); border-color: var(--bad, #c96); color: #1a0c0c; }
 .voteState {

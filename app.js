@@ -24,12 +24,12 @@
        separates a dozen dimensions at once and why near-universal facets like
        "English" or "Monthly" can never accumulate spurious evidence.
 
-     - UP AND DOWN ARROWS on every card in the ranked list, ranker.com style. A
-       vote is a position rather than a tally: pressing the active arrow again
-       deletes the event, so the model returns to exactly what it would have been
-       had the vote never been cast. A vote also scores the title directly
-       (WEIGHTS.voted) instead of only teaching its topics, because an
-       instruction about one magazine should move that magazine.
+     - UP AND DOWN ARROWS on every card in the ranked list. An arrow beside a
+       ranked row means "this one beats the one above it", so that is what it
+       records: a `prefer` between the two ADJACENT rows, the same event the duel
+       produces. The title moves about a place, pressing again compares it with
+       its new neighbour, and the list is always re-ranked from the model rather
+       than from a stored position.
 
    Hard constraints — language, price, format, whether to show pornography, and
    the list of BLOCKED titles — are never learned and never written by the model.
@@ -47,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 4;
+const APP_VERSION = 5;
 
 /* ============================================================== constants  */
 
@@ -187,14 +187,8 @@ const WEIGHTS = {
   repetition:    -1.3,   // topic covered too recently
   recentTitle:   -1.6,   // this exact title recommended too recently
   ownedIssue:    -4.0,   // this exact issue already bought or already read
-  // A direct up or down vote on THIS title. Deliberately large, and deliberately
-  // separate from prefFit: a vote is an instruction about one magazine, not
-  // evidence about a genre, and it has to be able to move that magazine on its
-  // own. Without this term the arrows looked broken — an upvoted title still
-  // learned its topics, but the novelty and exploration terms then penalised it
-  // for being exactly what the user had just said they wanted, and it could
-  // finish below titles nobody had expressed any opinion about at all.
-  voted:          1.9,
+  // Already in score units — see scoreCandidate.
+  nudge:          1.0,
 };
 
 const MONTHS = ['January','February','March','April','May','June','July',
@@ -383,6 +377,15 @@ const state = {
   // split or rediscovered under a new id and a block that leaks in those cases
   // is worse than useless.
   blocked: [],            // [{ id, canon, title, at, note }]
+  // Manual ranking adjustments from the up/down arrows: recordId -> score
+  // delta. The learning half of a vote cannot be trusted to move the title
+  // itself — boosting "finance" lifted the finance magazine ABOVE the one being
+  // voted up and the voted title went DOWN a place, which is indefensible from
+  // a button with an arrow on it. So the vote does two things: it teaches
+  // (applyPair, from the adjacent pair) and it asserts a position. This is the
+  // assertion, and it is the same kind of object as `overrides` in the Taste
+  // view — an explicit, visible, reversible user correction that wins.
+  nudges: {},             // recordId -> additive score delta
   meta: {
     onboarded: false,
     lastRefresh: 0,
@@ -551,6 +554,7 @@ async function loadState() {
     state.overrides = meta.overrides || {};
     state.merges = meta.merges || [];
     state.blocked = meta.blocked || [];
+    state.nudges = meta.nudges || {};
   }
 
   const cache = await idbGet('cache', 'all');
@@ -570,7 +574,7 @@ async function saveState() {
   await idbPut('meta', 'all', {
     meta: state.meta, filters: state.filters,
     overrides: state.overrides, merges: state.merges,
-    blocked: state.blocked,
+    blocked: state.blocked, nudges: state.nudges,
   });
   // The cache is the one store worth trimming: it is pure performance, it is
   // the only thing here that can grow without bound, and losing an entry costs
@@ -3510,14 +3514,14 @@ function recordEvent(kind, rec, extra = {}) {
 // A pairwise choice is one event, stored on the winner with the loser named.
 // Kept as a single record rather than a like plus a dislike because it is a
 // single judgement: the user did not say the loser was bad, only that it lost.
-function recordPair(winner, loser) {
-  const ev = recordEvent('prefer', winner, {
+function recordPair(winner, loser, extra = {}) {
+  return recordEvent('prefer', winner, {
     loserId: loser.id,
     loserTitle: loser.title,
     loserIssue: (loser.issue && loser.issue.label) || null,
     loserTopics: topEntries(loser.topics || {}, 5).map(([k]) => k),
+    ...extra,
   });
-  return ev;
 }
 
 /* ------------------------------------------------------- choosing the pair */
@@ -3678,17 +3682,18 @@ function historyContext() {
     }
   }
 
-  // The standing vote per title: the last of a like/dislike pair to be cast,
-  // since setVote() clears the previous one before recording a new one.
-  const votes = new Map();
+  // Titles the user has expressed any direct judgement about, either side of a
+  // comparison included. Used only to switch off the cold-start terms, which
+  // measure ignorance the user has already dispelled.
+  const judged = new Set();
   for (const ev of state.events) {
+    if (ev.kind === 'view' || ev.kind === 'open') continue;
     const rec = resolveRecord(ev.recordId);
-    const id = rec ? rec.id : ev.recordId;
-    if (ev.kind === 'like') votes.set(id, 1);
-    else if (ev.kind === 'dislike') votes.set(id, -1);
+    judged.add(rec ? rec.id : ev.recordId);
+    if (ev.loserId) judged.add(ev.loserId);
   }
 
-  return { boughtByRecord, readByRecord, recommendedAt, subjectMonths, skipped, votes };
+  return { boughtByRecord, readByRecord, recommendedAt, subjectMonths, skipped, judged };
 }
 
 /* =============================================================== ranking  */
@@ -3828,17 +3833,12 @@ function scoreCandidate(rec, t, ctx, f) {
     ? 'you have given almost no signal about these subjects'
     : 'these subjects are well covered by your history';
 
-  /* ---- a direct vote on this title ---- */
-  const vote = ctx.votes.get(rec.id) || 0;
-  parts.voted = vote;
-  notes.voted = vote > 0 ? 'you voted this up'
-    : vote < 0 ? 'you voted this down' : 'no vote either way';
-
-  // Novelty and exploration measure how little is known about something. A
-  // title the user has voted on is not unknown, so neither term applies to it —
-  // and leaving them in is what let an upvoted magazine be out-scored by one
-  // nobody had an opinion about.
-  if (vote !== 0) {
+  // Novelty and exploration measure how little is known about something, so
+  // they do not apply to a title the user has already ruled on. A vote is now a
+  // pairwise `prefer` against the neighbouring row rather than a score term of
+  // its own (see the voting section), so "ruled on" means any recorded judgement.
+  const judged = ctx.judged.has(rec.id);
+  if (judged) {
     parts.novelty = 0;
     parts.exploration = 0;
     notes.novelty = 'you have judged this title directly, so unfamiliarity is not in question';
@@ -3871,6 +3871,15 @@ function scoreCandidate(rec, t, ctx, f) {
   parts.ownedIssue = sameIss ? 1 : 0;
   notes.ownedIssue = sameIss ? 'you already have this exact issue' : '';
 
+  /* ---- manual position adjustment from the arrows ---- */
+  // Added raw rather than scaled, because it is denominated in score units by
+  // construction: nudge() solves for exactly the delta that puts this title one
+  // place higher and stores that. Shown in Research like every other term.
+  parts.nudge = state.nudges[rec.id] || 0;
+  notes.nudge = parts.nudge
+    ? 'you moved this ' + (parts.nudge > 0 ? 'up' : 'down') + ' the list by hand'
+    : '';
+
   // Diversity is not computable in isolation — it depends on what else has been
   // chosen — so it is filled in during selection and left at zero here.
   parts.diversity = 0;
@@ -3885,7 +3894,7 @@ function scoreCandidate(rec, t, ctx, f) {
   // below seven titles the model knew nothing about. They are worth a lot when
   // nothing is known and very little once something is, which is exactly what
   // maturity measures.
-  const coldStart = vote !== 0 ? 0 : 1 - 0.75 * (t.maturity || 0);
+  const coldStart = judged ? 0 : 1 - 0.75 * (t.maturity || 0);
   parts.novelty *= coldStart;
   parts.exploration *= coldStart;
   notes.novelty += t.maturity > 0.15
@@ -4216,7 +4225,7 @@ function comparison(better, worse) {
     repetition: 'repeats your recent subjects less',
     recentTitle: 'has not been recommended as recently',
     ownedIssue: 'is not an issue you already have',
-    voted: 'you voted it up',
+    nudge: 'you moved it up the list by hand',
   };
   return {
     against: worse.rec.title,
@@ -4788,7 +4797,10 @@ function viewMonth() {
 
   const grid = el('div', { class: 'grid' });
   const shown = r.chosen.slice(0, monthListLimit);
-  shown.forEach((c, i) => grid.append(rankCard(c, i + 1)));
+  // The full ranked list is handed to each card, not just the visible slice, so
+  // that "the one above" at the bottom edge of a paged list is the real next
+  // title rather than whichever row the pagination happened to stop on.
+  shown.forEach((c, i) => grid.append(rankCard(c, i + 1, { order: r.chosen })));
   main.append(grid);
   for (const c of shown.slice(0, 3)) markViewed(c.rec);
 
@@ -4930,44 +4942,165 @@ function confirmBlock(rec) {
   render();
 }
 
-function currentVote(rec) {
-  for (let i = state.events.length - 1; i >= 0; i--) {
-    const ev = state.events[i];
-    if (ev.recordId !== rec.id) continue;
-    if (ev.kind === 'like') return 1;
-    if (ev.kind === 'dislike') return -1;
+/* A vote moves a title ONE PLACE, and the move is the whole meaning of it.
+
+   The first version scored a vote directly (WEIGHTS.voted) and an upvote sent a
+   magazine straight to the top of the list, which is not what an up arrow beside
+   a ranked row means anywhere it appears. It means "this one beats the one above
+   it" — a statement about two adjacent titles, not about the whole shelf.
+
+   So that is exactly what it now records: an upvote on rank N is a pairwise
+   preference for N over N-1, the same `prefer` event the duel produces, and a
+   downvote is a preference for N+1 over N. The list then re-ranks from the
+   model rather than from any stored position, so the movement is earned. Because
+   the two titles were adjacent they score alike, applyPair cancels everything
+   they share, and the learned delta is correspondingly small — which is why the
+   title moves about a place instead of leaping.
+
+   Pressing again compares it with its NEW neighbour and walks it up another
+   step, exactly as repeated voting does on a ranked list. There is no toggle,
+   because "undo my vote" and "vote again" cannot both be the same button; the
+   events are in History and are individually deletable, which is the honest
+   undo and the one that rebuilds the model exactly. */
+
+// The duel teaches; the arrows arrange. An adjacent pair is similar by
+// construction, so it carries far less information than two magazines drawn
+// from opposite ends of the newsstand, and the user is tidying an order rather
+// than answering a question. It is weighted right down — 2.6 x 0.05, lighter
+// than a skip — for a measured reason as well as a principled one: at higher
+// weights a single press moved the row several places, because what it taught
+// reordered the rows around it too. Walked up one place at a time, the ladder
+// reads 7-6-5-4-3-2 at this value and 7-6-2-1 at 0.12.
+const NUDGE_WEIGHT_MUL = 0.05;
+
+// Net movement this title has been given by voting, for the card's readout.
+function voteTally(rec) {
+  let n = 0;
+  for (const ev of state.events) {
+    if (ev.kind !== 'prefer' || !ev.nudge) continue;
+    if (ev.recordId === rec.id) n++;
+    else if (ev.loserId === rec.id) n--;
   }
-  return 0;
+  return n;
 }
 
-function setVote(rec, dir) {
-  // Drop any standing vote first, so votes never accumulate.
-  for (const ev of state.events.filter(e => e.recordId === rec.id
-      && (e.kind === 'like' || e.kind === 'dislike'))) {
-    deleteEvent(ev.id);
+// `order` is the ranked list as currently displayed, so "the one above" means
+// the row the user can actually see above this one.
+//
+// Two things happen, and both are needed. The pairwise event is what the vote
+// TEACHES; the stored delta is what it ASSERTS. Teaching alone does not do the
+// job: the first version recorded only the comparison, and upvoting a finance
+// magazine taught "finance", which lifted the finance title already above it
+// further still and pushed the voted title DOWN a place. An arrow that moves a
+// row the wrong way is worse than one that does nothing.
+//
+// The delta is solved for AFTER the learning has been applied, against the
+// partner's post-learning score, so the two halves cannot fight. It is solved
+// rather than calculated because `diversity` is assigned during selection and
+// depends on what has already been chosen, so there is no closed form for "the
+// score that lands one place higher" — a few bounded probes are cheaper and
+// more honest than an approximation that is subtly wrong near the top.
+function nudge(rec, dir, order) {
+  const i = order.findIndex(c => c.rec.id === rec.id);
+  if (i < 0) return;
+
+  const partner = dir > 0 ? order[i - 1] : order[i + 1];
+  if (!partner) {
+    toast(dir > 0 ? 'Already top of the list' : 'Already bottom of the list');
+    return;
   }
-  if (dir === 1) { recordEvent('like', rec); toast('Voted up — the list has been re-ranked'); }
-  else if (dir === -1) { recordEvent('dislike', rec); toast('Voted down — the list has been re-ranked'); }
-  else toast('Vote cleared');
+  const partnerId = partner.rec.id;
+
+  // 1. Teach: this row beats the one it is being moved past.
+  const winner = dir > 0 ? rec : partner.rec;
+  const loser = dir > 0 ? partner.rec : rec;
+  recordPair(winner, loser, { nudge: true, weightMul: NUDGE_WEIGHT_MUL });
+  tasteCache.key = '';
+  state.ranked = null;
+
+  // 2. Assert: find the SMALLEST delta that lands the row exactly one place
+  //    from where the user saw it. The target is one place from the position
+  //    they were looking at, not from wherever the learning in step 1 has just
+  //    moved it to — the arrow has to answer to the list on screen.
+  //
+  //    Smallest matters. A first attempt grew the delta geometrically until the
+  //    row was past its partner, which overshot: a single press could carry a
+  //    title from seventh to second, because the step that finally worked was
+  //    several times larger than the one needed. Rank is monotonic in the delta,
+  //    so bisection finds the minimum and the row moves one place.
+  const rankOfMe = () => {
+    state.ranked = null;
+    return rankAll().chosen.findIndex(c => c.rec.id === rec.id);
+  };
+  const target = dir > 0 ? i - 1 : i + 1;
+  const base = state.nudges[rec.id] || 0;
+  const setDelta = d => { state.nudges[rec.id] = base + dir * d; };
+  const reached = () => {
+    const r = rankOfMe();
+    return r >= 0 && (dir > 0 ? r <= target : r >= target);
+  };
+
+  let hi = 0.05, ok = false;
+  for (let k = 0; k < 18 && !ok; k++) { setDelta(hi); if (reached()) ok = true; else hi *= 2; }
+  if (ok) {
+    let lo = 0;
+    for (let k = 0; k < 20; k++) {
+      const mid = (lo + hi) / 2;
+      setDelta(mid);
+      if (reached()) hi = mid; else lo = mid;
+    }
+    setDelta(hi);
+  }
+  // If 18 doublings could not reach it the row is pinned by a hard term such as
+  // ownedIssue, and no ranking delta should be able to override one. The delta
+  // is left where it got to rather than growing without bound.
+  state.ranked = null;
+  scheduleSave();
+
+  toast(dir > 0
+    ? rec.title + ' now ranks above ' + partner.rec.title
+    : partner.rec.title + ' now ranks above ' + rec.title);
   render();
 }
 
-function voteBox(rec) {
-  const v = currentVote(rec);
-  const box = el('div', { class: 'vote' + (v > 0 ? ' up' : v < 0 ? ' down' : '') });
-  box.append(el('button', {
-    class: 'voteBtn' + (v > 0 ? ' on' : ''),
-    title: v > 0 ? 'Remove your upvote' : 'More like this',
-    'aria-pressed': String(v > 0),
-    onclick: e => { e.stopPropagation(); setVote(rec, v > 0 ? 0 : 1); },
-  }, '▲'));
-  box.append(el('span', { class: 'voteState' }, v > 0 ? '+1' : v < 0 ? '−1' : '·'));
-  box.append(el('button', {
-    class: 'voteBtn' + (v < 0 ? ' on' : ''),
-    title: v < 0 ? 'Remove your downvote' : 'Less like this',
-    'aria-pressed': String(v < 0),
-    onclick: e => { e.stopPropagation(); setVote(rec, v < 0 ? 0 : -1); },
-  }, '▼'));
+// Undo every manual adjustment. The learning the votes produced is NOT undone
+// here — those are events and live in History, where they can be deleted
+// individually. This clears only the asserted positions.
+function clearNudges() {
+  state.nudges = {};
+  state.ranked = null;
+  scheduleSave();
+}
+
+function voteBox(rec, order) {
+  const n = voteTally(rec);
+  const box = el('div', { class: 'vote' + (n > 0 ? ' up' : n < 0 ? ' down' : '') });
+  const i = order ? order.findIndex(c => c.rec.id === rec.id) : -1;
+  // Without a ranked order there is no "the one above", so there is nothing
+  // honest for an arrow to record. Browse sorted by price is the case that
+  // matters: position there says nothing about preference.
+  const usable = !!order && i >= 0;
+
+  const up = el('button', {
+    class: 'voteBtn',
+    title: !usable ? 'Sort by best fit to vote'
+      : i > 0 ? 'Rank above ' + order[i - 1].rec.title : 'Already top of the list',
+    onclick: e => { e.stopPropagation(); if (order) nudge(rec, 1, order); },
+  }, '▲');
+  if (!usable || i === 0) up.disabled = true;
+  box.append(up);
+
+  box.append(el('span', { class: 'voteState' }, n > 0 ? '+' + n : n < 0 ? String(n) : '·'));
+
+  const down = el('button', {
+    class: 'voteBtn',
+    title: !usable ? 'Sort by best fit to vote'
+      : i < order.length - 1 ? 'Rank below ' + order[i + 1].rec.title : 'Already bottom of the list',
+    onclick: e => { e.stopPropagation(); if (order) nudge(rec, -1, order); },
+  }, '▼');
+  if (!usable || i === order.length - 1) down.disabled = true;
+  box.append(down);
+
   return box;
 }
 
@@ -4984,11 +5117,11 @@ function rankCard(cand, n, opts = {}) {
   const rec = cand.rec;
   const t = (state.ranked && state.ranked.t) || taste();
   const pct = matchPct(cand, t);
-  const vote = currentVote(rec);
+  const tally = voteTally(rec);
 
   const card = el('div', {
     class: 'card' + (cand.exploratory ? ' exploratory' : '')
-      + (vote > 0 ? ' votedUp' : vote < 0 ? ' votedDown' : ''),
+      + (tally > 0 ? ' votedUp' : tally < 0 ? ' votedDown' : ''),
   });
 
   const poster = el('div', { class: 'cardPoster' });
@@ -5016,7 +5149,7 @@ function rankCard(cand, n, opts = {}) {
       : (cand.fit && cand.fit.note) || 'no strong signal either way'));
 
   const foot = el('div', { class: 'cardFoot' });
-  foot.append(voteBox(rec));
+  foot.append(voteBox(rec, opts.order));
   const btns = el('div', { class: 'cardBtns' });
   btns.append(el('button', { class: 'tiny', onclick: () => openDetail(rec, cand) }, 'Details'));
   btns.append(el('button', { class: 'tiny', onclick: () => openBuy(rec) }, 'Bought'));
@@ -5239,7 +5372,11 @@ function viewBrowse() {
     listWrap.append(el('div', { class: 'muted small', style: 'margin:8px 0' },
       rows.length + ' of ' + all.length + ' shown'));
     const grid = el('div', { class: 'grid' });
-    rows.slice(0, 180).forEach((c, i) => grid.append(rankCard(c, i + 1)));
+    // Browse can be sorted by price or title, in which case "above" is a
+    // position in THAT order and a nudge there would mean nothing about taste.
+    // The arrows therefore only act when the list is in ranked order.
+    const order = browseSort === 'score' ? rows : null;
+    rows.slice(0, 180).forEach((c, i) => grid.append(rankCard(c, i + 1, { order })));
     listWrap.append(grid);
     if (rows.length > 180) {
       listWrap.append(el('p', { class: 'muted small' }, 'Showing the first 180.'));
@@ -5895,7 +6032,7 @@ function openDetail(rec, cand) {
     + (rec.category ? ' · ' + rec.category : '')));
   info.append(factRow(rec));
   info.append(topicChips(rec.topics, { limit: 12 }));
-  info.append(voteBox(rec));
+  info.append(voteBox(rec, (state.ranked && state.ranked.chosen) || []));
   head.append(info);
   body.append(head);
 
@@ -6170,6 +6307,20 @@ function renderDeck(target, opts = {}) {
       + 'comparison. Blocking teaches the taste model nothing — downvote as well if '
       + 'you also dislike the subject.'));
     target.append(wrap);
+  }
+
+  if (Object.keys(state.nudges || {}).length) {
+    const n = Object.keys(state.nudges).length;
+    target.append(el('label', { class: 'field', style: 'grid-column:1/-1' },
+      el('span', {}, 'Manual ranking order'),
+      el('button', {
+        class: 'ghost',
+        onclick: () => { clearNudges(); toast('Manual ordering cleared'); render(); },
+      }, 'Reset ' + n + ' hand-placed title' + (n === 1 ? '' : 's')),
+      el('small', { class: 'muted' },
+        'Positions you set with the ▲ ▼ arrows. Clearing these returns the list to '
+        + 'the model’s own order; it does not un-teach what the votes taught, which '
+        + 'lives in History as individual events.')));
   }
 
   target.append(multiSelect('Publication type', [
@@ -6543,7 +6694,7 @@ async function exportAll() {
     magazines: Array.from(state.magazines.values()),
     leads: state.leads, events: state.events,
     filters: state.filters, overrides: state.overrides,
-    merges: state.merges, blocked: state.blocked, meta: state.meta,
+    merges: state.merges, blocked: state.blocked, nudges: state.nudges, meta: state.meta,
   }, null, 1)], { type: 'application/json' });
   const a = el('a', { href: URL.createObjectURL(blob), download: 'maglens-' + new Date().toISOString().slice(0, 10) + '.json' });
   document.body.append(a);
@@ -6563,6 +6714,7 @@ async function importAll(e) {
     state.overrides = data.overrides || {};
     state.merges = data.merges || [];
     state.blocked = data.blocked || [];
+    state.nudges = data.nudges || {};
     Object.assign(state.meta, data.meta || {});
     tasteCache.key = '';
     state.ranked = null;

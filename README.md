@@ -204,11 +204,19 @@ your price ceiling should not silently unblock a dozen titles.
 
 ### Voting
 
-Every card carries ▲ and ▼. A vote is a **position, not a tally**: pressing the
-active arrow again clears it, and clearing *deletes the event* rather than
-patching the model, so what comes back is exactly the model that would have
-existed had you never voted. A vote also scores that title directly, not only its
-subjects — an instruction about one magazine should move that magazine.
+Every card carries ▲ and ▼, and they move a title **one place**, not to the top.
+An arrow beside a ranked row means "this one beats the one above it", so that is
+exactly what it records: a comparison between the two adjacent rows, the same
+event the duel produces. Press again and it is compared with its new neighbour
+and walks up another step.
+
+A vote does two things. It **teaches** — gently, since two adjacent titles are
+alike and the comparison says correspondingly little — and it **asserts** a
+position, stored as a visible, resettable adjustment. Both are needed: teaching
+alone once moved a row the *wrong way*, because upvoting a finance magazine
+taught "finance" and lifted the finance title already above it.
+
+The duel teaches; the arrows arrange.
 
 ### Everything else
 
@@ -260,11 +268,14 @@ term by term in Research → Scores with its weight in the column header. A
 surprising ranking is traceable to the term responsible in one click.
 
 `availability · freshness · prefFit · appeal · novelty · progression · valueFit ·
-exploration · voted` — minus `diversity · repetition · recentTitle · ownedIssue`.
+exploration · nudge` — minus `diversity · repetition · recentTitle · ownedIssue`.
 
 The preference term is stretched about its neutral point in proportion to how
 much the model knows, so an informed dislike can sink an otherwise excellent
 magazine while an uninformed one cannot.
+
+`nudge` is the position you set by hand with the arrows, in score units, and can
+be reset in the filter deck without un-teaching what the votes taught.
 
 `novelty` and `exploration` are **cold-start** terms and fade as the model
 matures. Both reward unfamiliarity, which a magazine that fits you lacks by

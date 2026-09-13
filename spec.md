@@ -730,3 +730,73 @@ and reshuffles neighbours as positions change. Some learning damps that.
 - the top row cannot be upvoted and the list is unchanged when tried;
 - the vote tally on the card reads +4 after four presses;
 - all five views render, and the v4 block and duel-cadence tests still pass.
+
+## 7. v6 — a quarter of every refresh was spent on cache hits
+
+Reported as a display oddity: *"whenever I press refresh, it starts from 36
+somehow."* The counter was telling the truth. Thirty-five of ninety planned
+reads completed before the first frame could paint, because they never touched
+the network.
+
+### 7.1 What was happening
+
+`fetchPage` returns immediately when the URL is in `state.cache` and the entry is
+younger than the TTL it was called with. `planFetches` did not know that, so it
+spent budget slots on leads whose pages it was certain to get back from cache.
+Those slots resolved in microseconds, `pooled` raced its counter up, and the
+progress text only became readable on reaching the first lead that needed a real
+fetch.
+
+The `hot` bucket was the main culprit and the check it was missing is simply
+absent, not wrong:
+
+```js
+if (rec && recommended.has(rec.id)) { hot.push({ lead, ageCycles, rec }); continue; }
+```
+
+No age test at all. Every currently-recommended title was planned on every
+refresh — `hotN` is `ceil(budget * 0.25)`, so 23 slots of 90 — and since they had
+just been read, all 23 came straight back out of cache. Weeklies and
+fortnightlies in the `stale` bucket did the same thing for a subtler reason:
+staleness is measured in publication cycles (`ageCycles >= 0.8`, about 5.6 days
+for a weekly) while `TTL.detail` is a flat 18 days, so a weekly could be
+correctly judged stale and still be served from cache.
+
+### 7.2 Why it mattered more than the counter
+
+The budget is defined in §1.4 as page reads *where a read changes the answer*. A
+read served from cache changes nothing by definition — it cannot discover a new
+issue, a new price, or a withdrawal. Those thirty-five slots were not slow, they
+were inert, and every one of them was a slot that never reached an unread title.
+Unread titles are the only thing that grows coverage, and coverage was the
+standing complaint behind §4.7.
+
+### 7.3 The fix
+
+`servedFromCache(url, ttl)` predicts what `fetchPage` will do, and `planFetches`
+skips those leads before spending a slot rather than discovering it afterwards.
+The TTL used in the prediction must match the one the connector will pass
+(`stub.hot ? TTL.detailHot : TTL.detail`) or it predicts the wrong thing.
+
+Measured on a synthetic 200-lead corpus — 40 already read and still cached, 25 of
+them currently recommended, 160 never read, budget 90:
+
+| | before | after |
+|---|---|---|
+| slots spent on cache hits | 25 | **0** |
+| slots reaching unread titles | 67 | **90** |
+
+A 34% increase in real coverage per refresh, with no additional fetching.
+
+The count is reported rather than hidden: the refresh log appends "*N* already
+current, not re-read", and the cycle summary carries a "Skipped as already
+current" row explaining that the budget went to unread titles instead. A number
+that silently improved would be as opaque as the one that silently leaked.
+
+### 7.4 Note on the counter itself
+
+It will still not count smoothly. `pooled` runs `CONCURRENCY` (12) workers and
+each calls `setProgress` with its own sequence number, so the displayed figure is
+whichever worker reported last and jumps around within a window of twelve. That
+is inherent to reading twelve pages at once and is not worth serialising to fix.
+What it will no longer do is begin at thirty-six.

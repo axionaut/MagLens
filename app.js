@@ -47,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 5;
+const APP_VERSION = 6;
 
 /* ============================================================== constants  */
 
@@ -4321,6 +4321,24 @@ function mergeLeads(stubs, sourceId) {
 // Which leads are worth a page read this month, in priority order. The three
 // bands are not a heuristic bolted on afterwards — they are the reason the app
 // can claim to be current at all on a budget.
+// Would reading this lead actually hit the network, or would fetchPage serve it
+// straight back out of state.cache? The budget is defined as "page reads where a
+// read changes the answer", and a read that resolves from cache changes nothing
+// by definition — it cannot discover a new issue, a new price, or a withdrawal.
+//
+// This was costing a quarter of every refresh. The `hot` bucket below takes
+// every currently-recommended title with NO age check at all, so the same ~23
+// titles were planned on every single refresh and every one of them came back
+// from cache in microseconds. The visible symptom was the progress counter
+// appearing to start at 36 of 90: those first thirty-five "reads" were cache
+// hits that completed before the first frame could paint. The real cost was
+// thirty-five slots that never reached an unread title, which is the only thing
+// that grows coverage.
+function servedFromCache(url, ttl) {
+  const hit = state.cache.get(url);
+  return !!(hit && hit.text && Date.now() - hit.at < ttl);
+}
+
 function planFetches(budget) {
   const now = Date.now();
   const f = state.filters || defaultFilters();
@@ -4334,6 +4352,7 @@ function planFetches(budget) {
   for (const rec of state.magazines.values()) for (const u of rec.urls || []) urlToRecord.set(u, rec);
 
   const hot = [], stale = [], fresh = [];
+  let cachedSkips = 0;
 
   for (const lead of state.leads) {
     if (lead.fails >= 3) continue;
@@ -4346,7 +4365,16 @@ function planFetches(budget) {
     // issues out of date.
     const cycleDays = (rec && rec.frequency && rec.frequency.days) || 30;
     const ageCycles = (now - lead.detailAt) / 864e5 / cycleDays;
-    if (rec && recommended.has(rec.id)) { hot.push({ lead, ageCycles, rec }); continue; }
+    const isHot = !!(rec && recommended.has(rec.id));
+
+    // Skipped before a slot is spent, not after. The TTL used here must match
+    // the one the connector will pass, or this predicts the wrong thing.
+    if (servedFromCache(lead.url, isHot ? TTL.detailHot : TTL.detail)) {
+      cachedSkips++;
+      continue;
+    }
+
+    if (isHot) { hot.push({ lead, ageCycles, rec }); continue; }
     if (ageCycles >= 0.8) stale.push({ lead, ageCycles, rec });
   }
 
@@ -4428,7 +4456,11 @@ function planFetches(budget) {
       stale.slice(0, staleN).map(x => ({ ...x.lead, why: 'reading is ' + x.ageCycles.toFixed(1) + ' cycles old' })),
       breadth.slice(0, breadthN).map(x => ({ ...x, why: 'never read' })),
     ),
-    counts: { hot: hotN, stale: staleN, breadth: breadthN, leads: state.leads.length, fresh: fresh.length },
+    counts: {
+      hot: hotN, stale: staleN, breadth: breadthN,
+      leads: state.leads.length, fresh: fresh.length,
+      cachedSkips,
+    },
   };
 }
 
@@ -4533,7 +4565,9 @@ async function runRefresh(opts = {}) {
     total = done + plan.length + 1;
     state.meta.lastPlan = counts;
     note('Reading ' + plan.length + ' issue pages (' + counts.hot + ' to verify, '
-      + counts.stale + ' stale, ' + counts.breadth + ' new)');
+      + counts.stale + ' stale, ' + counts.breadth + ' new)'
+      + (counts.cachedSkips
+        ? ' — ' + counts.cachedSkips + ' already current, not re-read' : ''));
 
     // Eight at a time rather than one after another. The per-upstream limiter
     // is still the thing that decides how fast requests actually leave, so this
@@ -5300,6 +5334,10 @@ function cycleSummary(r) {
   kv('Cleared your filters', String(r.scored.length));
   kv('Excluded', String(r.excluded.length));
   kv('Last refresh', state.meta.lastRefresh ? ago(state.meta.lastRefresh) + ' (' + (state.meta.lastRefreshSeconds || 0) + 's)' : 'never');
+  if (counts.cachedSkips) {
+    kv('Skipped as already current', counts.cachedSkips
+      + ' titles whose last reading is still within its cache lifetime, so the budget went to unread ones instead');
+  }
   kv('Taste model', r.t.empty ? 'empty — no interactions recorded'
     : r.t.eventCount + ' events, ' + Object.keys(r.t.topics).length + ' topics, '
       + r.t.progression.stride + ' stride');

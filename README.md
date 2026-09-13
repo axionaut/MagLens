@@ -72,6 +72,12 @@ silently converted into a rupee figure nobody is being offered.
 
 ### The fetch budget is the design
 
+A read that would be served from the local cache is never given a budget slot:
+it cannot discover a new issue, a new price or a withdrawal, so it does not
+change the answer and the slot goes to an unread title instead. Skipping them
+lifted real coverage per refresh by about a third.
+
+
 Enumerating what exists is one cheap request. Reading what is *in* a given issue
 is one request per title, and there are ten thousand titles. So a refresh spends
 a fixed budget (90 page reads by default) where a read changes the answer:

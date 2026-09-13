@@ -197,6 +197,10 @@ dimensions at once.
 
 ### Blocking
 
+**Block** is on every surface that shows a magazine — the ranked card, the
+comparison, the detail view and the Research table — and reads its own state, so
+a blocked title offers *Unblock* instead.
+
 **Block** removes a title from the app for good — out of the ranking, out of
 Browse, and out of either side of a comparison. It is the one control that
 teaches the taste model *nothing*, deliberately: people block because they

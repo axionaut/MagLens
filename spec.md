@@ -800,3 +800,140 @@ each calls `setProgress` with its own sequence number, so the displayed figure i
 whichever worker reported last and jumps around within a window of twelve. That
 is inherent to reading twelve pages at once and is not worth serialising to fix.
 What it will no longer do is begin at thirty-six.
+
+## 8. v7 — block everywhere, covers at the resolution they were always available in, duplicate titles
+
+### 8.1 Block, on every surface that shows a title
+
+Reported: the block option should be everywhere a magazine appears, including
+the duel. It was on the ranked card and in the detail modal only.
+
+Added to the comparison cards and to Research → Discovered, and unified as
+`blockToggle(rec)` — one control that reads its own state, so a surface showing
+a blocked title offers **Unblock** rather than an action already taken.
+
+The duel card had to stop being a `<button>`. It now carries buttons of its own
+(Choose this, Details, Block) and a button inside a button is invalid markup that
+browsers resolve by dropping one of them. It is a `div` with an onclick for
+convenience; "Choose this" is the real control. Every nested button calls
+`stopPropagation`, so blocking one side of a duel does not also record a
+preference for it — verified, because getting that wrong would silently poison
+the taste model with choices the user never made.
+
+### 8.2 Covers were being actively downgraded
+
+Reported as "find better resolution images". They were already available; the
+parser was throwing them away.
+
+The trailing number on a Magzter cover URL is a **resolution tier, not a page
+index**. Measured against a live issue folder:
+
+| URL | size | bytes |
+|---|---|---|
+| `thumb/1.jpg` | 160 × 200 | 11 KB |
+| `view/1.jpg` | 320 × 400 | 34 KB |
+| `view/2.jpg` | 640 × 800 | 105 KB |
+| `view/3.jpg` | 960 × 1200 | 194 KB |
+| `view/4.jpg` | 1280 × 1600 | 285 KB |
+| `view/5.jpg` | 1600 × 2000 | 379 KB |
+
+Every one is the front cover — confirmed by eye, not inferred. Nothing above 5
+exists and absent tiers answer 400 rather than redirecting.
+
+`pickMagzterCover` contained:
+
+```js
+if (bare) return bare[2].replace(/\/view\/\d+\.jpg/i, '/thumb/1.jpg');
+```
+
+It read `N` as a page number, assumed `view/2.jpg` was page two of the magazine,
+and rewrote every cover **down** to the smallest file on the CDN. A 160 × 200
+image was then stretched across a card 215 CSS pixels wide, and twice that again
+on a HiDPI display. This was never a resolution limit; the app was asking for the
+worst image available.
+
+Cards now use tier 2 and the duel and detail modal use tier 3, chosen at render
+time by `magzterTier()`, so stored records need no migration. `coverNode` falls
+back one step to `thumb/1.jpg` before the placeholder, because a small cover
+beats "no cover" — the placeholder is a statement about the issue, not about the
+CDN.
+
+### 8.3 A comment turned a function declaration into a function expression
+
+While fixing the above, `MAGZTER_SIZE_RE` was written through a layer of shell
+escaping that ate its backslashes, leaving:
+
+```js
+const MAGZTER_SIZE_RE = //(?:thumb|view)/d+.jpg/i;
+```
+
+`//` starts a line comment, so the `const` had no initialiser on its own line and
+swallowed the next statement instead — the `function magzterTier` **declaration**
+became a function *expression* assigned to `MAGZTER_SIZE_RE`, and `magzterTier`
+ceased to exist as a name.
+
+`node --check` passes this happily; it is valid JavaScript. Only running the code
+found it. Recorded because it is the second time in this project that a
+scripted edit has produced valid-but-wrong source, and the lesson is the same
+one: the syntax check is not the test.
+
+### 8.4 Duplicate magazines from spelling, accents and punctuation
+
+Reported: duplicates are being fetched, caused by spelling, special characters
+and typos. `canonTitle` is the key every duplicate decision rests on, and four
+classes were getting through:
+
+| class | example | old result |
+|---|---|---|
+| diacritics | Café Society / Cafe Society | `caf society` vs `cafe society` |
+| ampersands | Home & Style / Home and Style | `home style` vs `home and style` |
+| qualifiers | Vogue (India Edition) / Vogue Magazine | different |
+| typos | Buisness Today / Business Today | different, and unreachable |
+
+Accents were the sharpest: the old rule **deleted** the accented character
+outright rather than folding it, so `é` became nothing instead of `e`. Folding
+now goes through NFD, splitting the letter from its combining mark so the mark
+alone can be stripped.
+
+**What is deliberately not normalised matters more.** A trailing "India" looks
+like the same kind of qualifier and is not — Top Gear India is a separately
+licensed magazine from Top Gear, and the v1 code carried an explicit warning
+against merging them. A trailing "Hindi" or "English" is worse: India Today Hindi
+is a different publication from India Today, and folding them would also defeat
+the language filter, which is a hard constraint. `TRAILING_QUALIFIER` is
+therefore limited to format words — magazine, edition, print, digital, online,
+pdf, epaper. Femina / Femina India is instead surfaced by the existing
+"one title extends the other by a single token" rule, as a merge to *offer*.
+
+Typos are measured, not matched: `titleDistance` is a normalised Levenshtein
+distance, bounded early on a length difference of more than three. Pairs within
+15% are offered in Research → Duplicates, scored higher when the publisher also
+matches. Never merged automatically — Vogue and Rogue sit 0.20 apart, so any
+threshold loose enough to be useful is loose enough to be wrong, and a wrong
+automatic merge destroys two records' histories.
+
+### 8.5 Duplicate leads were also spending the budget
+
+The reported symptom was fetching, not merging, and that is a separate path.
+`planFetches` now skips a **never-read** lead whose canonical title and publisher
+already match a record that has been read. Reading it would spend a budget slot
+to learn nothing and then create a duplicate record for `autoMerge` to clean up
+afterwards. Publisher must match as well, which is what keeps Top Gear India
+fetchable.
+
+Only ever applied to unread leads; one already read is a record and is governed
+by the staleness rules. Reported in the refresh log as "N skipped as the same
+title under another listing", alongside the §7.3 cache-skip count.
+
+### 8.6 Verification
+
+| test | result |
+|---|---|
+| `canonTitle` — 5 must-match, 5 must-stay-distinct | 10/10 |
+| duplicate detection finds the typo pair, same publisher, score 0.70 | pass |
+| Femina Magazine and Cafe Society skipped as duplicate leads | pass |
+| Top Gear India and a genuinely new title still planned | pass |
+| cover tier rewrites, both directions, non-Magzter untouched | pass |
+| block present on card, duel, detail modal and Research | pass |
+| blocking one side of a duel records no preference | pass |
+| all five views render; v4–v6 suites still pass | pass |

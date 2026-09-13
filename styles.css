@@ -362,6 +362,7 @@ h2.sec:first-child { margin-top: 0; }
   border-radius: 5px; cursor: pointer;
 }
 .voteBtn:hover { color: var(--fg); border-color: var(--line2); }
+.blockedOn { border-color: #6b3234; color: #eda1a3; }
 .voteBtn:disabled { opacity: .28; cursor: default; }
 .voteBtn.on { background: var(--accent2); border-color: var(--accent2); color: #08131a; }
 .vote.down .voteBtn.on { background: var(--bad, #c96); border-color: var(--bad, #c96); color: #1a0c0c; }
@@ -389,6 +390,7 @@ h2.sec:first-child { margin-top: 0; }
 }
 
 .compareCard {
+  cursor: pointer;
   display: flex; flex-direction: column; gap: 8px; text-align: left;
   background: var(--bg); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 12px; cursor: pointer;
@@ -405,9 +407,13 @@ h2.sec:first-child { margin-top: 0; }
 .compareName { font-size: 15px; font-weight: 600; line-height: 1.25; }
 .compareMeta { font: 11.5px/1.4 var(--mono); color: var(--fg3); }
 .compareBlurb { font-size: 12px; color: var(--fg2); line-height: 1.45; }
+.compareActs {
+  margin-top: auto; padding-top: 10px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
 .comparePick {
-  margin-top: auto; align-self: flex-start;
-  font-size: 12px; font-weight: 600; padding: 6px 12px;
+  font-size: 12px; font-weight: 600; padding: 6px 12px; cursor: pointer;
+  background: transparent;
   border: 1px solid var(--line2); border-radius: 6px; color: var(--fg2);
   transition: background .15s, color .15s, border-color .15s;
 }

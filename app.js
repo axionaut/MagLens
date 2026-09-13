@@ -47,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 6;
+const APP_VERSION = 7;
 
 /* ============================================================== constants  */
 
@@ -1141,16 +1141,48 @@ function parseMagzterPage(text, stub, obs) {
 // The current issue's cover is the one bare image on the page: the header
 // carousel images are all wrapped in links to other magazines, and the recent
 // issue thumbnails are wrapped in links to their own issues. The page serves it
-// as an interior preview, /view/N.jpg; /thumb/1.jpg in the same issue folder is
-// the front cover.
+// as an interior preview. See COVER_TIER below for what the number means.
+// The trailing number on a Magzter cover URL is a RESOLUTION TIER, not a page
+// number, and mistaking it for one cost this app every cover it has ever shown.
+// Measured against a live issue folder:
+//
+//   thumb/1.jpg    160 x 200     11 KB
+//   view/1.jpg     320 x 400     34 KB
+//   view/2.jpg     640 x 800    105 KB   <- same image, sixteen times the pixels
+//   view/3.jpg     960 x 1200   194 KB
+//   view/4.jpg    1280 x 1600   285 KB
+//   view/5.jpg    1600 x 2000   379 KB
+//
+// Every one of them is the front cover; nothing above 5 exists, and a
+// non-existent tier answers 400 rather than redirecting. pickMagzterCover was
+// rewriting /view/N.jpg DOWN to /thumb/1.jpg, on the assumption that N was a
+// page index and that view/2 would be page two of the magazine. So a 160x200
+// image was being stretched across a card 215 CSS pixels wide, and twice that
+// again on any modern display. It was never a resolution limit — the app was
+// asking for the smallest file on offer.
+const COVER_TIER = { card: 2, large: 3 };
+const MAGZTER_SIZE_RE = /\/(?:thumb|view)\/\d+\.jpg/i;
+
+function magzterTier(url, tier) {
+  if (!url || url.indexOf('files.magzter.com') < 0) return url;
+  return String(url).replace(MAGZTER_SIZE_RE, '/view/' + tier + '.jpg');
+}
+
+// The smallest tier, kept as the fallback for titles whose issue folder carries
+// no view/ variants at all.
+function magzterThumb(url) {
+  if (!url || url.indexOf('files.magzter.com') < 0) return url;
+  return String(url).replace(MAGZTER_SIZE_RE, '/thumb/1.jpg');
+}
+
 function pickMagzterCover(text, obs) {
   const bare = /(^|[^(\[])!\[Image \d+:[^\]]*\]\((https:\/\/files\.magzter\.com\/resize\/magazine\/[^)]+)\)/m.exec(text);
-  if (bare) return bare[2].replace(/\/view\/\d+\.jpg/i, '/thumb/1.jpg');
+  if (bare) return magzterTier(bare[2], COVER_TIER.card);
   // Fall back to the newest recent-issue thumbnail, but only when its label is
   // the issue we believe is current. A cover from the wrong month is worse than
   // no cover: it is a confident-looking lie about what is on the shelf.
   const first = obs.recentIssues[0];
-  if (first && obs.issueLabel && first.label.toLowerCase() === obs.issueLabel.toLowerCase()) return first.cover;
+  if (first && obs.issueLabel && first.label.toLowerCase() === obs.issueLabel.toLowerCase()) return magzterTier(first.cover, COVER_TIER.card);
   return null;
 }
 
@@ -1817,13 +1849,101 @@ function observedCadence(recentIssues) {
 // Titles are compared after this, never before. "Autocar India Magazine" and
 // "Autocar-India" are the same shelf; "BBC Top Gear" and "Top Gear India" are
 // not, and the normaliser must not be so aggressive that it merges them.
+// The key every duplicate decision rests on, so what it fails to normalise
+// arrives as two magazines. Four classes of difference were getting through and
+// each was producing real duplicates in the corpus:
+//
+//   diacritics    "Café Society" vs "Cafe Society" — the old rule deleted the
+//                 accented letter outright rather than folding it, so these
+//                 normalised to "caf society" and "cafe society"
+//   ampersands    "Home & Style" vs "Home and Style"
+//   filler words  "Femina India" vs "Femina", "Vogue Print" vs "Vogue"
+//   punctuation   smart quotes, en dashes, stray full stops
+//
+// Folding happens through NFD so a combining mark can be stripped separately
+// from the letter it sits on, which is what turns é into e instead of nothing.
+// The key every duplicate decision rests on, so whatever it fails to normalise
+// arrives in the app as two magazines. Four classes were getting through, and
+// each was producing real duplicates in the corpus:
+//
+//   diacritics    "Café Society" vs "Cafe Society" — the old rule DELETED the
+//                 accented letter rather than folding it, so these normalised
+//                 to "caf society" and "cafe society" and never met
+//   ampersands    "Home & Style" vs "Home and Style"
+//   qualifiers    "Femina India" vs "Femina", "Vogue (India Edition)" vs "Vogue"
+//   punctuation   smart quotes, en dashes, stray stops
+//
+// Folding goes through NFD so a combining mark can be stripped separately from
+// the letter it sits on, which is what turns é into e rather than into nothing.
+const TITLE_NOISE = new RegExp('\\b(?:' + [
+  'magazine', 'magazines', 'the', 'a', 'an', 'and', 'of',
+  'edition', 'editions', 'issue', 'issues', 'vol', 'volume',
+  'pdf', 'epaper', 'official',
+  'ltd', 'pvt', 'limited', 'inc', 'llp',
+].join('|') + ')\\b', 'g');
+
+// Words that are noise ONLY at the end of a title, where they describe the
+// format rather than name the product. Stripped in a loop so "Vogue Magazine
+// Digital" unwinds completely.
+//
+// Deliberately short, and what is NOT in it matters more than what is. A
+// trailing "India" looks like the same kind of qualifier and is not: Top Gear
+// India is a separately licensed magazine from Top Gear, and the original code
+// carried an explicit warning against merging them. A trailing "Hindi" or
+// "English" is worse still — India Today Hindi is a different publication from
+// India Today, and folding them together would also defeat the language filter,
+// which is a hard constraint.
+//
+// Those cases are not ignored, they are routed elsewhere: duplicateCandidates
+// already treats "one title extends the other by a single token" as a merge to
+// OFFER, scored by whether the publisher matches. Femina / Femina India is
+// surfaced there for a human, which is the right place for a judgement that a
+// string cannot settle.
+const TRAILING_QUALIFIER = /s+(?:magazine|edition|print|digital|online|pdf|epaper)$/;
+
 function canonTitle(t) {
-  return String(t || '')
+  let s = String(t || '')
+    .normalize('NFD')                        // split é into e + combining acute
+    .replace(/[̀-ͯ]/g, '')         // …then drop the mark, keep the letter
     .toLowerCase()
-    .replace(/\(.*?\)/g, ' ')
-    .replace(/\b(magazine|the|digital|edition|india\s+edition)\b/g, ' ')
+    .replace(/[‘’“”]/g, "'")   // smart quotes
+    .replace(/[‐-―]/g, '-')              // en and em dashes
+    .replace(/\(.*?\)/g, ' ')                      // "(India Edition)"
+    .replace(/&/g, ' and ')                        // before the noise pass removes it
+    .replace(TITLE_NOISE, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
+    .trim()
+    .replace(/\s+/g, ' ');
+
+  let prev;
+  do { prev = s; s = s.replace(TRAILING_QUALIFIER, '').trim(); } while (s !== prev);
+  return s;
+}
+
+// Normalised edit distance between two canonical titles, used only to OFFER a
+// merge and never to make one. A typo is the one duplicate class no amount of
+// tidy normalisation can reach — "Buisness Today" and "Business Today" differ by
+// a transposition and nothing else — so it is measured rather than matched.
+// Bounded early: two titles of very different lengths are not typos of one
+// another, and the early return keeps this off the hot path for the 10,000-lead
+// case.
+function titleDistance(a, b) {
+  if (a === b) return 0;
+  if (!a || !b) return 1;
+  if (Math.abs(a.length - b.length) > 3) return 1;
+  const m = a.length, n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, k) => k);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,
+        cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n] / Math.max(m, n);
 }
 
 // Language, normalised out of whatever the source called it, plus a fallback
@@ -2299,6 +2419,28 @@ function duplicateCandidates() {
       }
     }
   }
+  // Typos and transpositions. Nothing above can reach these: "Buisness Today"
+  // normalises to a different string from "Business Today" and always will, so
+  // the difference is measured instead. Offered, never merged automatically —
+  // "Vogue" and "Rogue" sit 0.20 apart, so any threshold loose enough to be
+  // useful is also loose enough to be wrong, and a wrong automatic merge
+  // destroys two records' histories.
+  const seenPair = new Set(pairs.map(p => [p.a.id, p.b.id].sort().join('|')));
+  for (let i = 0; i < keys.length; i++) {
+    for (let j = i + 1; j < keys.length; j++) {
+      const d = titleDistance(keys[i], keys[j]);
+      if (d === 0 || d > 0.15) continue;
+      for (const ra of byTitle.get(keys[i])) for (const rb of byTitle.get(keys[j])) {
+        if (seenPair.has([ra.id, rb.id].sort().join('|'))) continue;
+        const samePub = ra.publisher && rb.publisher
+          && canonTitle(ra.publisher) === canonTitle(rb.publisher);
+        pushPair(ra, rb, samePub ? 0.7 : 0.3,
+          'titles differ by ' + Math.round(d * 100) + '% — a probable misspelling'
+          + (samePub ? ', same publisher' : ', different publishers'));
+      }
+    }
+  }
+
   return pairs.filter(p => p.verdict !== 'distinct')
     .sort((x, y) => y.score - x.score);
 }
@@ -4351,14 +4493,35 @@ function planFetches(budget) {
   const urlToRecord = new Map();
   for (const rec of state.magazines.values()) for (const u of rec.urls || []) urlToRecord.set(u, rec);
 
+  // What has already been read, by canonical title and publisher. A lead whose
+  // title normalises onto a record we have already fetched is the same magazine
+  // listed twice — different URL, different shelf, same product — and reading it
+  // again spends a budget slot to learn nothing and then creates a duplicate
+  // record for autoMerge to clean up afterwards. Cheaper and cleaner not to
+  // fetch it. Publisher must match too: "Top Gear" and "Top Gear India" are
+  // separate licensed magazines and only the publisher separates them here.
+  const knownTitles = new Set();
+  for (const rec of state.magazines.values()) {
+    const ct = canonTitle(rec.title);
+    if (ct) knownTitles.add(ct + '|' + canonTitle(rec.publisher || ''));
+  }
+
   const hot = [], stale = [], fresh = [];
   let cachedSkips = 0;
+  let duplicateSkips = 0;
 
   for (const lead of state.leads) {
     if (lead.fails >= 3) continue;
     const rec = urlToRecord.get(lead.url);
 
-    if (!lead.detailAt) { fresh.push(lead); continue; }
+    if (!lead.detailAt) {
+      // Only ever applied to a lead that has never been read. One that HAS been
+      // read is already a record and is governed by the staleness rules below.
+      const key = canonTitle(lead.title || '') + '|' + canonTitle(lead.publisher || '');
+      if (canonTitle(lead.title || '') && knownTitles.has(key)) { duplicateSkips++; continue; }
+      fresh.push(lead);
+      continue;
+    }
 
     // Staleness is measured in publication cycles, not days. A four-week-old
     // reading of a quarterly is current; the same reading of a weekly is four
@@ -4459,7 +4622,7 @@ function planFetches(budget) {
     counts: {
       hot: hotN, stale: staleN, breadth: breadthN,
       leads: state.leads.length, fresh: fresh.length,
-      cachedSkips,
+      cachedSkips, duplicateSkips,
     },
   };
 }
@@ -4567,7 +4730,9 @@ async function runRefresh(opts = {}) {
     note('Reading ' + plan.length + ' issue pages (' + counts.hot + ' to verify, '
       + counts.stale + ' stale, ' + counts.breadth + ' new)'
       + (counts.cachedSkips
-        ? ' — ' + counts.cachedSkips + ' already current, not re-read' : ''));
+        ? ' — ' + counts.cachedSkips + ' already current, not re-read' : '')
+      + (counts.duplicateSkips
+        ? ', ' + counts.duplicateSkips + ' skipped as the same title under another listing' : ''));
 
     // Eight at a time rather than one after another. The per-upstream limiter
     // is still the thing that decides how fast requests actually leave, so this
@@ -4663,8 +4828,16 @@ function coverNode(rec, opts = {}) {
   const box = el('div', { class: 'coverBox' });
   if (rec.coverUrl) {
     const img = el('img', {
-      src: rec.coverUrl, alt: rec.title + ' cover', loading: 'lazy',
-      onerror: e => { e.target.replaceWith(missingCover(rec, 'the cover image would not load')); },
+      src: magzterTier(rec.coverUrl, opts.tier || COVER_TIER.card),
+      alt: rec.title + ' cover', loading: 'lazy',
+      onerror: e => {
+        // Two steps down before giving up. A title whose issue folder carries no
+        // view/ tier still has a thumb, and a small cover beats the placeholder —
+        // which says something about the ISSUE, not about the CDN.
+        const thumb = magzterThumb(rec.coverUrl);
+        if (thumb && e.target.src !== thumb) { e.target.src = thumb; return; }
+        e.target.replaceWith(missingCover(rec, 'the cover image would not load'));
+      },
     });
     box.append(img);
   } else {
@@ -4760,7 +4933,7 @@ function actionRow(cand, opts = {}) {
   row.append(el('button', { onclick: () => openReject(rec, 'notInterested') }, 'Not interested'));
   row.append(el('button', { onclick: () => { recordEvent('alreadyRead', rec); toast('Marked as already read'); render(); } }, 'Already read'));
   row.append(el('button', { class: 'ghost', onclick: () => openDetail(rec, cand) }, 'Details & sources'));
-  row.append(el('button', { class: 'ghost', onclick: () => confirmBlock(rec) }, 'Block this title'));
+  row.append(blockToggle(rec, { label: 'Block this title' }));
   if (!opts.noSkip) {
     row.append(el('button', { class: 'ghost', onclick: () => openReject(rec, 'skip') }, 'Skip this month'));
   }
@@ -4958,6 +5131,21 @@ function uncertaintyBox(rec) {
    Clearing DELETES the event, which is what makes it honest: the model that
    comes back is exactly the model that would have existed had the vote never
    been cast. */
+
+// The block control as a single toggle, so that every surface showing a title
+// shows its true state rather than an action that may already have been taken.
+function blockToggle(rec, opts = {}) {
+  const on = isBlocked(rec);
+  return el('button', {
+    class: 'tiny ghost' + (on ? ' blockedOn' : ''),
+    title: on ? 'Show this title again' : 'Never show this title again',
+    onclick: e => {
+      e.stopPropagation();
+      if (on) { unblockRecord((state.blocked || []).find(b => b.id === rec.id || b.canon === blockKey(rec))); render(); }
+      else confirmBlock(rec);
+    },
+  }, on ? 'Unblock' : (opts.label || 'Block'));
+}
 
 function confirmBlock(rec) {
   blockRecord(rec);
@@ -5190,10 +5378,7 @@ function rankCard(cand, n, opts = {}) {
   if (!opts.noSkip) {
     btns.append(el('button', { class: 'tiny ghost', onclick: () => openReject(rec, 'notInterested') }, 'Not for me'));
   }
-  btns.append(el('button', {
-    class: 'tiny ghost', title: 'Never show this title again',
-    onclick: () => confirmBlock(rec),
-  }, 'Block'));
+  btns.append(blockToggle(rec));
   foot.append(btns);
   body.append(foot);
   card.append(body);
@@ -5269,15 +5454,19 @@ function comparePanel(r) {
   const row = el('div', { class: 'compareRow' });
   for (const side of [pair.a, pair.b]) {
     const other = side === pair.a ? pair.b : pair.a;
-    const opt = el('button', {
-      class: 'compareCard',
-      onclick: () => {
-        recordPair(side.rec, other.rec);
-        toast('Learned: ' + side.rec.title + ' over ' + other.rec.title);
-        render();
-      },
-    });
-    opt.append(el('div', { class: 'compareCover' }, coverNode(side.rec)));
+    const choose = () => {
+      recordPair(side.rec, other.rec);
+      toast('Learned: ' + side.rec.title + ' over ' + other.rec.title);
+      render();
+    };
+
+    // A div rather than a button, because this card carries buttons of its own
+    // — Block, and Details — and a button inside a button is invalid markup
+    // that browsers resolve by dropping one of them. The whole card stays
+    // clickable for convenience; "Choose this" is the real control and is what
+    // the keyboard reaches.
+    const opt = el('div', { class: 'compareCard', onclick: choose });
+    opt.append(el('div', { class: 'compareCover' }, coverNode(side.rec, { tier: COVER_TIER.large })));
     opt.append(el('div', { class: 'compareName' }, side.rec.title));
     opt.append(el('div', { class: 'compareMeta' },
       ((side.rec.issue && side.rec.issue.label) || 'issue unknown')
@@ -5285,7 +5474,19 @@ function comparePanel(r) {
     opt.append(topicChips(side.rec.topics, { limit: 3 }));
     opt.append(el('div', { class: 'compareBlurb' },
       (side.rec.content.summary.text || '').slice(0, 150)));
-    opt.append(el('span', { class: 'comparePick' }, 'Choose this'));
+
+    const acts = el('div', { class: 'compareActs' });
+    acts.append(el('button', { class: 'comparePick', onclick: e => { e.stopPropagation(); choose(); } },
+      'Choose this'));
+    acts.append(el('button', {
+      class: 'tiny ghost', title: 'Details & sources',
+      onclick: e => { e.stopPropagation(); openDetail(side.rec, side); },
+    }, 'Details'));
+    // Being asked to choose between two magazines is exactly when you discover
+    // that one of them should never have been offered, so the block has to be
+    // reachable here and not only from the ranked list below.
+    acts.append(blockToggle(side.rec));
+    opt.append(acts);
     row.append(opt);
   }
   panel.append(row);
@@ -5869,7 +6070,8 @@ function researchDiscovered() {
       el('td', { class: 'mono' }, ago(rec.lastChecked)),
       el('td', {},
         el('button', { class: 'tiny ghost', onclick: () => openDetail(rec) }, 'Open'),
-        el('button', { class: 'tiny ghost', onclick: () => openEdit(rec) }, 'Correct'))));
+        el('button', { class: 'tiny ghost', onclick: () => openEdit(rec) }, 'Correct'),
+        blockToggle(rec))));
   }
   tbl.append(tb);
   tw.append(tbl);
@@ -6061,7 +6263,7 @@ function openDetail(rec, cand) {
   recordEvent('open', rec);
 
   const head = el('div', { class: 'detailHead' });
-  head.append(coverNode(rec));
+  head.append(coverNode(rec, { tier: COVER_TIER.large }));
   const info = el('div', {});
   info.append(el('h2', {}, rec.title));
   info.append(el('div', { class: 'muted' },
@@ -6071,6 +6273,10 @@ function openDetail(rec, cand) {
   info.append(factRow(rec));
   info.append(topicChips(rec.topics, { limit: 12 }));
   info.append(voteBox(rec, (state.ranked && state.ranked.chosen) || []));
+  // actionRow below is only rendered when a ranked candidate was passed in, so
+  // the modal needs its own copy for the cases that open without one.
+  info.append(el('div', { class: 'chipWrap', style: 'margin-top:8px' },
+    blockToggle(rec, { label: 'Block this title' })));
   head.append(info);
   body.append(head);
 

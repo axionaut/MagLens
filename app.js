@@ -31,9 +31,12 @@
        (WEIGHTS.voted) instead of only teaching its topics, because an
        instruction about one magazine should move that magazine.
 
-   Hard constraints — language, price, format, and whether to show pornography —
-   are never learned and never written by the model. They live in the filter deck
-   and only the user sets them.
+   Hard constraints — language, price, format, whether to show pornography, and
+   the list of BLOCKED titles — are never learned and never written by the model.
+   They live in the filter deck and only the user sets them. A block is the
+   bluntest of them: it removes a title from the app for good and teaches the
+   taste model nothing, because people block for reasons that say nothing about
+   taste (they already subscribe, it is not sold near them).
 
    Layering, in dependency order, each section marked with a banner below:
      util → state → persistence → net → connectors → normalise → dedupe →
@@ -44,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 3;
+const APP_VERSION = 4;
 
 /* ============================================================== constants  */
 
@@ -156,6 +159,9 @@ const EVENT_WEIGHT = {
   // Recorded for the history timeline and for "have I seen this already"; it is
   // not trained on at all. See buildTaste().
   view:          0,
+  // Also zero, and for a stronger reason: see the blocking section. A block is
+  // a statement about one magazine's place in this app, not about taste.
+  block:         0,
 };
 
 // Events that speak against a magazine. `alreadyRead` is neither: it removes an
@@ -319,6 +325,23 @@ function toast(msg, ms = 2600) {
   toast._t = setTimeout(() => { t.hidden = true; }, ms);
 }
 
+// A toast with a single action on it. Used by anything instant and reversible,
+// so the reversal is offered where the action happened rather than filed away
+// in a settings screen the user has to go looking for.
+function toastAction(msg, label, fn, ms = 7000) {
+  const t = $('#toast');
+  t.replaceChildren();
+  t.append(el('span', {}, msg));
+  t.append(el('button', {
+    class: 'tiny',
+    style: 'margin-left:12px',
+    onclick: () => { t.hidden = true; clearTimeout(toast._t); fn(); },
+  }, label));
+  t.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.hidden = true; }, ms);
+}
+
 // Cosine over sparse topic maps. Used for every "how similar are these two
 // magazines" question in the app — overlap detection, diversity, novelty and
 // progression all reduce to this.
@@ -353,6 +376,13 @@ const state = {
   filters: null,          // hard constraints, user-set only
   overrides: {},          // manual corrections to learned inferences
   merges: [],             // manual duplicate decisions: {a, b, verdict}
+  // Titles the user never wants to see again. A hard gate, not a preference:
+  // kept OUT of `filters` deliberately, so that "Reset filters" cannot silently
+  // unblock a magazine somebody took the trouble to block. Entries carry the
+  // canonical title as well as the record id, because a record can be merged,
+  // split or rediscovered under a new id and a block that leaks in those cases
+  // is worse than useless.
+  blocked: [],            // [{ id, canon, title, at, note }]
   meta: {
     onboarded: false,
     lastRefresh: 0,
@@ -520,6 +550,7 @@ async function loadState() {
     }
     state.overrides = meta.overrides || {};
     state.merges = meta.merges || [];
+    state.blocked = meta.blocked || [];
   }
 
   const cache = await idbGet('cache', 'all');
@@ -539,6 +570,7 @@ async function saveState() {
   await idbPut('meta', 'all', {
     meta: state.meta, filters: state.filters,
     overrides: state.overrides, merges: state.merges,
+    blocked: state.blocked,
   });
   // The cache is the one store worth trimming: it is pure performance, it is
   // the only thing here that can grow without bound, and losing an entry costs
@@ -2780,9 +2812,60 @@ function nonLatinTitle(title) {
   return /[^ -ɏ -⁯₠-⃏]/.test(String(title || ''));
 }
 
+/* ------------------------------------------------------------- blocking */
+/* "Never show me this again." A hard gate and the bluntest control in the app,
+   kept deliberately distinct from the three softer things it is easy to confuse
+   it with:
+
+     - a DOWNVOTE says this one is worse than the others and is a ranking term;
+     - NOT INTERESTED declines this issue and teaches from the reason given;
+     - a BLOCK removes the title from the app entirely, for good, and teaches
+       nothing at all.
+
+   That last point is the important one. People block for reasons that say
+   nothing about taste — they already subscribe, it is not sold near them, they
+   read it at work — and a block that quietly trained the model against the
+   subject would punish a whole shelf for a fact about one magazine. Blocking is
+   therefore recorded at weight 0 and appears in History for visibility only.
+   Anyone who blocks something because they dislike it can also downvote it, and
+   the two controls sit next to each other. */
+
+function blockKey(rec) { return canonTitle(rec.title || '') || rec.id; }
+
+function isBlocked(rec) {
+  const canon = blockKey(rec);
+  return (state.blocked || []).some(b => b.id === rec.id || (b.canon && b.canon === canon));
+}
+
+function blockRecord(rec, note) {
+  if (isBlocked(rec)) return;
+  state.blocked.push({
+    id: rec.id, canon: blockKey(rec), title: rec.title,
+    at: Date.now(), note: note || null,
+  });
+  // Recorded so the History timeline shows it. EVENT_WEIGHT.block is 0 — see
+  // the note above; this must not move the taste model.
+  recordEvent('block', rec);
+  state.ranked = null;
+  scheduleSave();
+}
+
+function unblockRecord(entry) {
+  state.blocked = (state.blocked || []).filter(b => b !== entry);
+  state.ranked = null;
+  scheduleSave();
+}
+
 function evaluateFilters(rec, f) {
   const fails = [];
   const fail = (filter, reason) => fails.push({ filter, reason });
+
+  // Checked first and on its own terms: a blocked title is gone, whatever else
+  // it scores and whatever else is set.
+  if (isBlocked(rec)) {
+    fail('blocked', 'you blocked this title — unblock it in Filters');
+    return { pass: false, fails };
+  }
 
   if (f.indiaOnly && rec.availability === 'gone') {
     fail('availability in India', 'the listing has been retired at every source read');
@@ -3096,6 +3179,15 @@ function buildTaste() {
     // skip — which the user produces deliberately.
     if (ev.kind === 'view') { model.eventCount++; continue; }
 
+    // Blocking is a hard constraint, not a preference — see the blocking
+    // section. It has to be skipped HERE rather than relying on its zero in
+    // EVENT_WEIGHT, because the lookup below falls back to 0.2 for an unknown
+    // kind and `0 || 0.2` is 0.2: a weight of zero and no weight at all are the
+    // same value to that expression. A block would otherwise have trained the
+    // model against the subject of a magazine somebody blocked because they
+    // already subscribe to it.
+    if (ev.kind === 'block') { model.eventCount++; continue; }
+
     const w = (EVENT_WEIGHT[ev.kind] || 0.2) * (ev.weightMul || 1);
     if (!w) continue;
 
@@ -3256,7 +3348,16 @@ function buildTaste() {
 function finaliseTaste(model) {
   const ALPHA = 0.7;   // smoothing; with no evidence a topic sits at zero utility
   const view = {
-    empty: model.eventCount === 0,
+    // "Nothing has been LEARNED", which is not the same as "nothing has been
+    // recorded". eventCount includes the two kinds that are deliberately not
+    // trained on — `view` and `block` — so defining emptiness by it meant the
+    // model stopped calling itself empty after a single render, purely because
+    // rendering the month view logs a view. Every card then showed a match
+    // percentage derived from no evidence at all, and the "this is not a
+    // personalised recommendation yet" panel disappeared while it was still
+    // entirely true. Weight is the honest test: it only moves when something
+    // was actually learned from.
+    empty: model.totalWeight <= 0,
     eventCount: model.eventCount,
     totalWeight: model.totalWeight,
     // How far the model has earned the right to override everything else. At
@@ -4616,6 +4717,7 @@ function actionRow(cand, opts = {}) {
   row.append(el('button', { onclick: () => openReject(rec, 'notInterested') }, 'Not interested'));
   row.append(el('button', { onclick: () => { recordEvent('alreadyRead', rec); toast('Marked as already read'); render(); } }, 'Already read'));
   row.append(el('button', { class: 'ghost', onclick: () => openDetail(rec, cand) }, 'Details & sources'));
+  row.append(el('button', { class: 'ghost', onclick: () => confirmBlock(rec) }, 'Block this title'));
   if (!opts.noSkip) {
     row.append(el('button', { class: 'ghost', onclick: () => openReject(rec, 'skip') }, 'Skip this month'));
   }
@@ -4666,10 +4768,12 @@ function viewMonth() {
     return;
   }
 
-  // The comparison comes first, because it is the thing that makes everything
-  // below it better and it costs one click.
-  const cmp = comparePanel(r);
+  // The comparison earns the top of the page only when it is due — see
+  // compareDue(). Otherwise it collapses to a one-line invitation, so the
+  // answer to "which magazine should I buy" is the first thing on screen.
+  const cmp = compareDue(t) ? comparePanel(r) : null;
   if (cmp) main.append(cmp);
+  else main.append(compareInvite(r));
 
   main.append(el('h2', { class: 'sec' },
     t.empty ? 'Every magazine on sale now, ranked' : 'Ranked for you'));
@@ -4809,6 +4913,23 @@ function uncertaintyBox(rec) {
    comes back is exactly the model that would have existed had the vote never
    been cast. */
 
+function confirmBlock(rec) {
+  blockRecord(rec);
+  closeModal('#detailModal');
+  // Blocking is instant rather than behind a confirm dialog, because it is
+  // reversible and a dialog on every block would make the control annoying
+  // enough to go unused. The undo is what pays for that: it is offered for as
+  // long as the toast stands, and the full list is in Filters afterwards.
+  const entry = state.blocked[state.blocked.length - 1];
+  toastAction(rec.title + ' blocked', 'Undo', () => {
+    unblockRecord(entry);
+    const evs = state.events.filter(e => e.kind === 'block' && e.recordId === rec.id);
+    for (const e of evs) deleteEvent(e.id);
+    render();
+  });
+  render();
+}
+
 function currentVote(rec) {
   for (let i = state.events.length - 1; i >= 0; i--) {
     const ev = state.events[i];
@@ -4902,6 +5023,10 @@ function rankCard(cand, n, opts = {}) {
   if (!opts.noSkip) {
     btns.append(el('button', { class: 'tiny ghost', onclick: () => openReject(rec, 'notInterested') }, 'Not for me'));
   }
+  btns.append(el('button', {
+    class: 'tiny ghost', title: 'Never show this title again',
+    onclick: () => confirmBlock(rec),
+  }, 'Block'));
   foot.append(btns);
   body.append(foot);
   card.append(body);
@@ -4918,6 +5043,49 @@ function rankCard(cand, n, opts = {}) {
    shelf: applyPair() cancels everything two magazines share, so a pair from the
    same shelf teaches almost nothing while a car magazine against a cookery one
    separates a dozen dimensions at once. */
+
+// Dismissed for this session only. A block is forever; not wanting to be asked
+// right now is not, so this deliberately does not persist.
+let compareDismissed = false;
+let compareSummoned = false;
+
+// Whether the duel earns the top of the page this render. It is the best signal
+// the app has, which is exactly why it must not be permanent furniture: a
+// question that is always there stops being a question and becomes a banner to
+// scroll past, and the answers it does collect start coming from people trying
+// to clear it. So it is shown when it is genuinely the most useful thing on the
+// screen — at the very start, while the model is still thin, or after a gap —
+// and is otherwise reduced to a one-line invitation that can be taken up
+// whenever the user feels like it.
+function compareDue(t) {
+  if (compareDismissed) return false;
+  if (compareSummoned) return true;
+  if (t.empty) return true;                       // the only way to bootstrap
+
+  const answered = state.events.filter(e => e.kind === 'prefer');
+  if (answered.length < 5) return true;           // still cheap and still moving
+
+  const last = answered[answered.length - 1].at;
+  const hours = (Date.now() - last) / 36e5;
+  // Asked less often as the model firms up: at low maturity a fresh answer is
+  // worth a lot, near the top it is worth little and the shelf is worth more.
+  const gapHours = 6 + 42 * (t.maturity || 0);
+  return hours >= gapHours;
+}
+
+// The collapsed form: one line, no cover art, no commitment.
+function compareInvite(r) {
+  const bar = el('div', { class: 'compareInvite' });
+  const answered = state.events.filter(e => e.kind === 'prefer').length;
+  bar.append(el('span', { class: 'muted small' },
+    answered + ' comparison' + (answered === 1 ? '' : 's') + ' answered · '
+    + Math.round(r.t.maturity * 100) + '% model maturity'));
+  bar.append(el('button', {
+    class: 'ghost',
+    onclick: () => { compareSummoned = true; compareDismissed = false; render(); },
+  }, 'Compare two magazines'));
+  return bar;
+}
 
 function comparePanel(r) {
   const pair = pickComparison(r.scored, r.t);
@@ -4967,6 +5135,10 @@ function comparePanel(r) {
         render();
       },
     }, 'Skip — can’t say'),
+    el('button', {
+      class: 'ghost',
+      onclick: () => { compareDismissed = true; compareSummoned = false; render(); },
+    }, 'Not now'),
     el('span', { class: 'muted small' },
       r.t.empty ? 'Nothing is recorded until you choose.'
         : r.t.eventCount + ' judgements so far · model maturity ' + Math.round(r.t.maturity * 100) + '%')));
@@ -5976,6 +6148,30 @@ function renderDeck(target, opts = {}) {
     [true, 'Only titles on sale in India'], [false, 'Include anything found'],
   ], f.indiaOnly, v => set('indiaOnly', v === 'true')));
 
+  // Blocked titles live with the filters because that is what they are — a
+  // hard constraint the user set. They are stored outside `filters` all the
+  // same, so "Reset filters" cannot silently unblock them.
+  if ((state.blocked || []).length) {
+    const wrap = el('div', { class: 'field', style: 'grid-column:1/-1' });
+    wrap.append(el('span', {}, 'Blocked titles (' + state.blocked.length + ')'));
+    const list = el('div', { class: 'blockList' });
+    for (const b of state.blocked.slice().sort((x, y) => y.at - x.at)) {
+      list.append(el('div', { class: 'blockRow' },
+        el('span', { class: 't' }, b.title || b.id),
+        el('span', { class: 'when' }, ago(b.at)),
+        el('button', {
+          class: 'tiny',
+          onclick: () => { unblockRecord(b); render(); },
+        }, 'Unblock')));
+    }
+    wrap.append(list);
+    wrap.append(el('small', { class: 'muted' },
+      'Blocked titles never appear in the ranking, in Browse, or as one side of a '
+      + 'comparison. Blocking teaches the taste model nothing — downvote as well if '
+      + 'you also dislike the subject.'));
+    target.append(wrap);
+  }
+
   target.append(multiSelect('Publication type', [
     ['magazine', 0], ['newspaper', 0], ['journal', 0], ['book', 0],
   ], f.kinds, v => set('kinds', v),
@@ -6026,6 +6222,15 @@ function activeFilterPills() {
     add(f.kinds.length ? f.kinds.join('/') : 'all types', () => f.kinds = d.kinds.slice());
   }
   if (f.minConfidence !== d.minConfidence) add('confidence ≥ ' + f.minConfidence, () => f.minConfidence = d.minConfidence);
+  // Not removable from the pill row: one × should not silently unblock a list
+  // of titles the user blocked one at a time. It opens the deck instead.
+  if ((state.blocked || []).length) {
+    pills.push({
+      label: state.blocked.length + ' blocked',
+      reset: () => toggleDeck(true),
+      keep: true,
+    });
+  }
   return pills;
 }
 
@@ -6176,11 +6381,17 @@ function render() {
   const pillBox = $('#activePills');
   pillBox.replaceChildren();
   for (const p of pills) {
+    // A pill marked `keep` stands for a list rather than a single setting, so its
+    // control opens the deck to manage it. Clearing a dozen blocked titles with
+    // one stray × is not an undo anybody wanted.
     pillBox.append(el('span', { class: 'pill' }, p.label,
       el('button', {
-        title: 'Remove',
-        onclick: () => { p.reset(); state.ranked = null; scheduleSave(); render(); },
-      }, '×')));
+        title: p.keep ? 'Manage' : 'Remove',
+        onclick: () => {
+          if (p.keep) { p.reset(); return; }
+          p.reset(); state.ranked = null; scheduleSave(); render();
+        },
+      }, p.keep ? '⋯' : '×')));
   }
 
   $('#headline').textContent = headlineText();
@@ -6332,7 +6543,7 @@ async function exportAll() {
     magazines: Array.from(state.magazines.values()),
     leads: state.leads, events: state.events,
     filters: state.filters, overrides: state.overrides,
-    merges: state.merges, meta: state.meta,
+    merges: state.merges, blocked: state.blocked, meta: state.meta,
   }, null, 1)], { type: 'application/json' });
   const a = el('a', { href: URL.createObjectURL(blob), download: 'maglens-' + new Date().toISOString().slice(0, 10) + '.json' });
   document.body.append(a);
@@ -6351,6 +6562,7 @@ async function importAll(e) {
     state.filters = { ...defaultFilters(), ...(data.filters || {}) };
     state.overrides = data.overrides || {};
     state.merges = data.merges || [];
+    state.blocked = data.blocked || [];
     Object.assign(state.meta, data.meta || {});
     tasteCache.key = '';
     state.ranked = null;

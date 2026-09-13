@@ -520,3 +520,122 @@ zero failures; the vote button and both comparison cards dispatch real clicks
 and record the expected events; 12 match badges present on a 12-title corpus.
 Lead deduplication confirmed (4 raw → 3 distinct → 2 consumer). `node --check
 app.js` and `git diff --check` clean. The owner does the browser testing.
+
+## 5. v4 — blocking, a duel that knows when to stop asking, full-width layout
+
+### 5.1 Blocking a title
+
+Requested as a plain "option to block a magazine". Implemented as the bluntest
+control in the app and kept deliberately distinct from the three softer things
+it is easy to confuse it with:
+
+| control | scope | teaches the model |
+|---|---|---|
+| downvote (▼) | ranking term on one title | yes |
+| Not for me | declines this issue, with a reason | yes, via `REASON_EFFECTS` |
+| **Block** | removes the title from the app, permanently | **no** |
+
+The "teaches nothing" column is the design decision worth recording. People
+block for reasons that say nothing whatever about taste — they already
+subscribe, it is not sold near them, they read it at work — and a block that
+quietly trained the model against the subject would punish a whole shelf for a
+fact about one magazine. Anyone blocking out of dislike can downvote as well,
+and the two controls sit beside each other on the card.
+
+`state.blocked` holds `{ id, canon, title, at, note }` and is stored **outside**
+`filters`, so that "Reset filters" cannot silently unblock a magazine somebody
+took the trouble to block. Entries carry the canonical title as well as the
+record id, because a record can be merged, split or rediscovered under a new id
+and a block that leaks in those cases is worse than useless.
+
+The gate is the first check in `evaluateFilters` and returns immediately, so a
+blocked title is gone from the ranking, from Browse, and from either side of a
+comparison, whatever else it scores.
+
+Blocking is instant rather than behind a confirm dialog — a dialog on every
+block makes the control annoying enough to go unused — and is paid for by an
+undo offered in the toast (`toastAction`, new). The full list, with per-title
+unblock, is in the filter deck; a `N blocked` pill appears in the header. That
+pill's control is `⋯` and opens the deck rather than `×` clearing the list,
+because one stray click should not undo a dozen separate decisions.
+
+### 5.2 A zero weight is not the same as no weight
+
+`EVENT_WEIGHT.block` was set to 0 to keep blocks out of training, exactly as
+`view` is. That is not sufficient, and the reason is a live trap in
+`buildTaste`:
+
+```js
+const w = (EVENT_WEIGHT[ev.kind] || 0.2) * (ev.weightMul || 1);
+```
+
+`0 || 0.2` is `0.2`. The fallback for an *unknown* event kind silently captures
+any kind whose weight is deliberately zero, so a block would have trained at
+0.2 — above `skip`. `view` escapes only because it is `continue`d before this
+line ever runs. `block` now does the same, and the comment at that line records
+why the zero in the table is decorative rather than load-bearing.
+
+### 5.3 `empty` meant "nothing recorded", not "nothing learned"
+
+Found while testing §5.2 and pre-existing since v1. `finaliseTaste` defined:
+
+```js
+empty: model.eventCount === 0
+```
+
+but `eventCount` is incremented for the two kinds that are deliberately *not*
+trained on. Rendering the month view calls `markViewed`, which logs a `view`, so
+**the model stopped describing itself as empty after a single render** — with
+nothing learned from. Every card then showed a match percentage derived from no
+evidence at all, the "this is not a personalised recommendation yet" panel
+disappeared while it was still entirely true, and `selectShortlist` dropped out
+of its cold-start diversity pressure of 1.5.
+
+Now `empty: model.totalWeight <= 0`. Weight only moves when something was
+actually learned from, which is the honest test. `eventCount` remains for
+display.
+
+### 5.4 The duel no longer sits permanently at the top
+
+Reported directly: *"the comparison/duel shouldn't always be present on top."*
+
+The comparison is the best signal the app has, which is exactly why it must not
+be permanent furniture. A question that is always there stops being a question
+and becomes a banner to scroll past, and the answers it does collect start
+coming from people trying to clear it rather than people expressing a
+preference.
+
+`compareDue()` shows the full panel when it is genuinely the most useful thing
+on screen — an empty model (the only way to bootstrap), fewer than five answers,
+or after a gap — and otherwise collapses it to `compareInvite()`, a single line
+carrying the answer count, model maturity, and a button. The gap widens as the
+model firms up: `6 + 42 * maturity` hours, so a fresh answer is asked for often
+while it is worth a lot and rarely once it is not.
+
+A `Not now` control dismisses it for the session. That deliberately does not
+persist: a block is forever, not wanting to be asked right now is not.
+
+### 5.5 Full-width layout
+
+Reported: *"the space is not being used properly to full width."*
+
+`main` carried `max-width: 1180px; margin: 0 auto`, which left most of a wide
+monitor empty now that the view is a card grid rather than one hero. The cap
+existed to keep prose readable, so that job was moved to the prose: `main` is
+now full width with a gutter of `clamp(16px, 2.2vw, 44px)`, the header shares
+the same gutter so it lines up, and running text carries its own `88ch` measure.
+The card grid drops to `minmax(215px, 1fr)` so a wide screen gains columns
+rather than wider cards. `.compareRow` is capped at 980px — two magazine covers
+stretched across an ultrawide is not a comparison anybody can scan.
+
+### 5.6 Verification
+
+jsdom smoke test over the real `index.html` and `app.js`, 0 failures:
+
+- a blocked title leaves the grid, is excluded with reason `blocked`, and is
+  absent from `scored` so it can never be drawn into a duel;
+- blocking leaves `taste.empty === true` and zero learned topics;
+- unblocking restores the title to the grid;
+- the duel is due on an empty model, not due at 0.82 maturity after six
+  answers, collapses to the invite bar, and expands again on demand;
+- all five views render.

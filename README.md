@@ -17,9 +17,11 @@ evidence behind it, and can be corrected or deleted.
 
 **It learns by asking you to choose.** Two magazines at a time, drawn from
 opposite ends of the newsstand: *which of these would you rather read?* Only what
-makes the two different is recorded, so anything they share is ignored. Every
-card in the ranked list below also carries up and down arrows, and pressing one
-re-ranks the list on the spot.
+makes the two different is recorded, so anything they share is ignored. It asks
+often at the start and progressively less as the model firms up, collapsing to a
+single line you can take up whenever you feel like it. Every card in the ranked
+list also carries up and down arrows, and pressing one re-ranks the list on the
+spot.
 
 Static: `index.html` + `styles.css` + `app.js`. No build step, no dependencies,
 no backend, no accounts, nothing paid.
@@ -186,6 +188,19 @@ Pairs are drawn deliberately **across** the newsstand rather than within a shelf
 and with a large random element. A choice between two cookery monthlies teaches
 almost nothing; a cookery monthly against a car magazine separates a dozen
 dimensions at once.
+
+### Blocking
+
+**Block** removes a title from the app for good — out of the ranking, out of
+Browse, and out of either side of a comparison. It is the one control that
+teaches the taste model *nothing*, deliberately: people block because they
+already subscribe, or because it is not sold near them, and a block that quietly
+trained against the subject would punish a whole shelf for a fact about one
+magazine. Downvote as well if you also dislike it.
+
+Blocking is one click with an undo in the toast; the full list, with per-title
+unblock, is in the filter deck. It survives *Reset filters*, because resetting
+your price ceiling should not silently unblock a dozen titles.
 
 ### Voting
 

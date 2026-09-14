@@ -960,10 +960,11 @@ with the cap lifted:
 | 200 | 0.9 s |
 | 400 | 7.7 s |
 | 800 | 62 s |
-| 1600 | abandoned |
+| 1600 | 535 s (8.9 min) |
 
-At the 4,606 consumer magazines the app has already indexed it would never
-finish. Removing the page button without touching this would have hung the tab.
+Two titles for every one costs 8.6 times the work, which is the cubic curve
+exactly. Extrapolated along it, the 4,606 consumer magazines the app has already
+indexed would take something over three hours. Removing the page button without touching this would have hung the tab.
 
 Two changes, and they remove different factors:
 
@@ -985,9 +986,14 @@ diversity note instead of reporting a zero that looks like a measurement.
 | 200 | 899 ms | 50 ms |
 | 400 | 7,653 ms | 61 ms |
 | 800 | 61,825 ms | 127 ms |
+| 1600 | 535,001 ms | 285 ms |
 | 3000 | — | 486 ms |
 
-800 titles went from 62 seconds to 127 ms, a factor of 490.
+800 titles went from 62 seconds to 127 ms, a factor of 490; 1,600 went from
+nearly nine minutes to 285 ms, a factor of 1,877.
+
+(The 1600 row was left as "abandoned" when this section was first written — the
+measurement was still running and was allowed to finish afterwards.)
 
 ### 9.2 Building the DOM without freezing the tab
 

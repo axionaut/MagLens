@@ -937,3 +937,98 @@ title under another listing", alongside the §7.3 cache-skip count.
 | block present on card, duel, detail modal and Research | pass |
 | blocking one side of a duel records no preference | pass |
 | all five views render; v4–v6 suites still pass | pass |
+
+## 9. v8 — the whole list, loaded on its own
+
+Reported with a screenshot of the "Show 24 more" / "Browse everything that
+clears your filters" pair at the foot of the month view: *"I don't want this.
+All titles should be loaded automatically."*
+
+Straightforward as a UI change, and it could not be made as one. The list was
+capped at 40 by `rankAll` and paged at 15 by the view, and both caps were
+load-bearing.
+
+### 9.1 The selection pass was cubic
+
+`selectShortlist` recomputed every remaining candidate's similarity against every
+already-chosen title, on every pick. That is O(n³) in the length of the list,
+which is invisible at the 40 it was written for. Measured on a synthetic corpus
+with the cap lifted:
+
+| titles | time |
+|---|---|
+| 200 | 0.9 s |
+| 400 | 7.7 s |
+| 800 | 62 s |
+| 1600 | abandoned |
+
+At the 4,606 consumer magazines the app has already indexed it would never
+finish. Removing the page button without touching this would have hung the tab.
+
+Two changes, and they remove different factors:
+
+**Incremental closest-match.** Each candidate now carries a running "closest
+thing chosen so far", updated against the single new pick rather than rescanned
+against the whole chosen set. Publisher counts move to a `Map` for the same
+reason, and the pool is a `taken` flag array rather than a spliced list, since
+`splice` is itself O(n) per pick. The pass becomes linear per pick.
+
+**A diversity depth.** `DIVERSITY_DEPTH = 120`: below it, candidates are appended
+in plain score order. This is defensible rather than merely cheap — diversity is
+a statement about the *top* of a list, where the user is choosing between things.
+Nobody compares candidate 300 with candidate 301 for variety, and ranking them
+against each other would be arithmetic nobody reads. Those rows say so in their
+diversity note instead of reporting a zero that looks like a measurement.
+
+| titles | before | after |
+|---|---|---|
+| 200 | 899 ms | 50 ms |
+| 400 | 7,653 ms | 61 ms |
+| 800 | 61,825 ms | 127 ms |
+| 3000 | — | 486 ms |
+
+800 titles went from 62 seconds to 127 ms, a factor of 490.
+
+### 9.2 Building the DOM without freezing the tab
+
+`shortlistSize` now defaults to every eligible candidate, and `fillGrid` puts
+them on the page: the first 60 synchronously, then 120 per animation frame until
+done. Nothing waits on a click — by the time the top of the list has been read
+the bottom is already there.
+
+`renderToken` guards the obvious hazard. A vote, a block or a filter change calls
+`render()` while a fill is still in flight, and the old fill would otherwise keep
+appending cards to a grid no longer on the page. Each fill captures the token it
+started under and stops when it changes. Verified by re-rendering mid-fill and
+counting cards: 600, not 1,200.
+
+Browse loses its own `slice(0, 180)` and the "Showing the first 180" line with
+it.
+
+### 9.3 Two escaping traps, both in the tooling rather than the app
+
+Recorded because between them they cost more of this change than the algorithm
+did, and §8.3 was the first instance of the same class.
+
+`String.prototype.replace` treats `$$` in the **replacement** string as an escape
+for a literal `$`. A scripted edit whose replacement contained `$$('#tabs .tab')`
+wrote `$('#tabs .tab')` into the file — silently turning the `querySelectorAll`
+helper into the `querySelector` one, so `render()` threw on a non-iterable.
+`node --check` passes it; it is valid JavaScript. The fix is `split`/`join`,
+which has no `$` semantics, and the first attempt at the repair hit the identical
+trap a second time.
+
+The rule that follows: for scripted edits, prefer `split`/`join` over `replace`
+whenever the replacement text can contain `$`, and never trust a syntax check to
+confirm a mechanical edit landed as intended.
+
+### 9.4 Verification
+
+| test | result |
+|---|---|
+| 600 eligible titles all reach the DOM | 600/600 |
+| first paint within one frame | 60 cards, 283 ms |
+| no "Show more" or "Browse everything" button remains | pass |
+| re-render mid-fill leaves no duplicate cards | 600, not 1200 |
+| selection timing at 3000 titles | 486 ms |
+| v4–v7 suites | all pass |

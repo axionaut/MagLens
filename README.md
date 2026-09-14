@@ -299,8 +299,14 @@ term alone, not the total — the total mixes in availability and freshness, whi
 are facts about the shop rather than about you, and a number labelled *match* has
 to mean what it says. With an empty model every card reads 50%.
 
+Every title that clears your filters is ranked and shown — there is no page
+size and no "show more". The list builds itself in the background: the first
+screenful lands immediately and the rest follows across animation frames.
+
 Selection is separate from scoring: the second pick is not the second-best
-magazine, it is the best magazine *given* the first. Overlap costs nothing below
+magazine, it is the best magazine *given* the first. That comparison runs for the
+top 120, which is where variety is a real question; below that, titles are
+ordered on their own score and say so. Overlap costs nothing below
 your tolerance and rises steeply above it, so two genuinely different magazines
 are never punished for sharing a subject while two interchangeable ones are.
 Publisher repetition is penalised too — the same house three times reads as a rut

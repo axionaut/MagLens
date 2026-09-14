@@ -47,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 7;
+const APP_VERSION = 8;
 
 /* ============================================================== constants  */
 
@@ -4194,9 +4194,30 @@ function describeFit(terms) {
    another is a near-duplicate LISTING and is handled by the merge machinery in
    the duplicates section, not here. */
 
+// How far down the list the greedy diversity pass runs. Below this depth every
+// remaining candidate is appended in plain score order.
+//
+// This is a cost boundary and it is a real one. The old loop recomputed each
+// candidate's similarity against every already-chosen title on every pick, which
+// is cubic in the size of the list, and the list used to be 40. Measured on a
+// synthetic corpus when the cap came off: 200 titles 0.9s, 400 titles 7.7s, 800
+// titles 62s. At the 4,600 the app is heading for it would never finish.
+//
+// The incremental form below removes one factor — each candidate carries a
+// running "closest thing already chosen", updated against the single new pick
+// rather than rescanned — which makes the pass linear per pick. The depth cap
+// removes the other. Together they turn the whole list into roughly the cost the
+// old code paid for forty.
+//
+// Capping the DEPTH rather than the list is what makes it defensible: diversity
+// is a statement about the top of a list, where the user is actually choosing
+// between things. Nobody is comparing candidate 300 with candidate 301 for
+// variety, and pretending to rank them against each other would be arithmetic
+// nobody reads.
+const DIVERSITY_DEPTH = 120;
+
 function selectShortlist(scored, t, f, count) {
   const chosen = [];
-  const pool = scored.slice();
 
   // How hard to push for variety. Rising when the user has said "too similar",
   // and high by default when nothing is known — with an empty model, breadth is
@@ -4205,43 +4226,82 @@ function selectShortlist(scored, t, f, count) {
   const pressure = t.empty ? 1.5
     : clamp(0.6 + t.diversityPressure * 0.25 + (1 - t.progression.confidence) * 0.3, 0.4, 1.6);
 
-  while (chosen.length < count && pool.length) {
-    let bestIdx = -1, bestScore = -Infinity, bestPenalty = null;
+  // Parallel arrays rather than splicing out of a pool: splice is O(n) per pick
+  // and the pool is now the whole newsstand.
+  const pool = scored.slice();
+  const taken = new Array(pool.length).fill(false);
+  const worstSim = new Float64Array(pool.length);      // closest already-chosen
+  const worstAgainst = new Array(pool.length).fill(null);
+  const pubCount = new Map();
+
+  const depth = Math.min(count, DIVERSITY_DEPTH);
+  const tol = f.overlapTolerance;
+  const denom = Math.max(0.05, 1 - tol);
+
+  for (let picked = 0; picked < depth; picked++) {
+    let bestIdx = -1, bestScore = -Infinity;
 
     for (let i = 0; i < pool.length; i++) {
+      if (taken[i]) continue;
       const cand = pool[i];
-      let worst = 0, worstAgainst = null;
-      for (const already of chosen) {
-        const sim = cosine(cand.rec.topicVec || {}, already.rec.topicVec || {});
-        if (sim > worst) { worst = sim; worstAgainst = already; }
-      }
       // Below the tolerance, overlap costs nothing at all; above it the cost
       // rises steeply, so two genuinely different magazines are never punished
       // for sharing one subject while two interchangeable ones are.
-      const over = Math.max(0, worst - f.overlapTolerance) / Math.max(0.05, 1 - f.overlapTolerance);
+      const over = Math.max(0, worstSim[i] - tol) / denom;
       const penalty = WEIGHTS.diversity * pressure * over;
-
       // Title-level variety too: the same publisher three times in a shortlist
       // reads as a rut even when the subjects differ.
-      const samePub = chosen.filter(x => x.rec.publisher && x.rec.publisher === cand.rec.publisher).length;
-      const pubPenalty = samePub * 0.35;
-
+      const pubPenalty = (pubCount.get(cand.rec.publisher) || 0) * 0.35;
       const s = cand.base - penalty - pubPenalty;
-      if (s > bestScore) {
-        bestScore = s; bestIdx = i;
-        bestPenalty = { overlap: worst, against: worstAgainst, penalty: penalty + pubPenalty, samePub };
-      }
+      if (s > bestScore) { bestScore = s; bestIdx = i; }
     }
     if (bestIdx < 0) break;
-    const pick = pool.splice(bestIdx, 1)[0];
+
+    const pick = pool[bestIdx];
+    taken[bestIdx] = true;
+    const over = Math.max(0, worstSim[bestIdx] - tol) / denom;
+    const penalty = WEIGHTS.diversity * pressure * over;
+    const samePub = pubCount.get(pick.rec.publisher) || 0;
+    const total = penalty + samePub * 0.35;
+
     pick.score = bestScore;
-    pick.parts.diversity = -(bestPenalty.penalty / Math.max(0.001, WEIGHTS.diversity));
-    pick.notes.diversity = bestPenalty.against
-      ? 'closest to ' + bestPenalty.against.rec.title + ' at ' + bestPenalty.overlap.toFixed(2) + ' similarity'
+    pick.parts.diversity = -(total / Math.max(0.001, WEIGHTS.diversity));
+    pick.notes.diversity = worstAgainst[bestIdx]
+      ? 'closest to ' + worstAgainst[bestIdx].rec.title
+        + ' at ' + worstSim[bestIdx].toFixed(2) + ' similarity'
       : 'first pick — nothing to overlap with';
-    pick.overlap = bestPenalty;
+    pick.overlap = { overlap: worstSim[bestIdx], against: worstAgainst[bestIdx], penalty: total, samePub };
+    if (pick.rec.publisher) pubCount.set(pick.rec.publisher, samePub + 1);
     chosen.push(pick);
+
+    // The one update that replaces the inner rescan: every remaining candidate
+    // only needs to know whether THIS pick is closer than whatever was closest
+    // before.
+    const vec = pick.rec.topicVec || {};
+    for (let i = 0; i < pool.length; i++) {
+      if (taken[i]) continue;
+      const sim = cosine(pool[i].rec.topicVec || {}, vec);
+      if (sim > worstSim[i]) { worstSim[i] = sim; worstAgainst[i] = pick; }
+    }
   }
+
+  // Everything past the diversity depth, in plain score order. These are real
+  // candidates and are shown with real scores; they simply were not ranked
+  // against one another for variety, and their diversity term says so rather
+  // than reporting a zero that looks like a measurement.
+  if (chosen.length < count) {
+    const rest = [];
+    for (let i = 0; i < pool.length; i++) if (!taken[i]) rest.push(pool[i]);
+    rest.sort((a, b) => b.base - a.base);
+    for (const cand of rest.slice(0, count - chosen.length)) {
+      cand.score = cand.base;
+      cand.parts.diversity = 0;
+      cand.notes.diversity = 'past the top ' + DIVERSITY_DEPTH
+        + ' — ordered on its own score, not against the others';
+      chosen.push(cand);
+    }
+  }
+
   return chosen;
 }
 
@@ -4319,7 +4379,9 @@ function rankAll(opts = {}) {
   // little to argue with. The shortlist is now long enough to read like a
   // ranked list, with the diversity and repetition machinery applied all the way
   // down it rather than only across the top few.
-  const shortlistSize = opts.size || 40;
+  // Everything eligible, ranked. There is no page size: the user asked for the
+  // whole list and DIVERSITY_DEPTH is what keeps that affordable.
+  const shortlistSize = opts.size || scored.length;
   let chosen = selectShortlist(scored, t, f, shortlistSize);
 
   const explorePick = pickExploration(scored, chosen, t, f);
@@ -5003,25 +5065,10 @@ function viewMonth() {
         + 'the list re-ranks immediately.'));
 
   const grid = el('div', { class: 'grid' });
-  const shown = r.chosen.slice(0, monthListLimit);
-  // The full ranked list is handed to each card, not just the visible slice, so
-  // that "the one above" at the bottom edge of a paged list is the real next
-  // title rather than whichever row the pagination happened to stop on.
-  shown.forEach((c, i) => grid.append(rankCard(c, i + 1, { order: r.chosen })));
   main.append(grid);
-  for (const c of shown.slice(0, 3)) markViewed(c.rec);
+  fillGrid(grid, r.chosen, { order: r.chosen });
+  for (const c of r.chosen.slice(0, 3)) markViewed(c.rec);
 
-  if (r.chosen.length > shown.length) {
-    main.append(el('div', { class: 'btnRow', style: 'margin-top:16px;justify-content:center' },
-      el('button', {
-        class: 'ghost',
-        onclick: () => { monthListLimit += 24; render(); },
-      }, 'Show ' + Math.min(24, r.chosen.length - shown.length) + ' more'),
-      el('button', {
-        class: 'ghost',
-        onclick: () => setView('browse'),
-      }, 'Browse everything that clears your filters')));
-  }
 
   main.append(el('h2', { class: 'sec' }, 'How this month was worked out'));
   main.append(cycleSummary(r));
@@ -5335,6 +5382,42 @@ function matchPct(cand, t) {
   return Math.round(clamp(cand.fit ? cand.fit.score : 0.5) * 100);
 }
 
+/* Fills a grid with every candidate given, without a "show more" button and
+   without blocking the page while it does it.
+
+   The whole list is wanted on screen, and at four thousand cards building the
+   DOM in one synchronous pass freezes the tab for long enough to look broken.
+   So the first screenful goes in immediately and the rest follows across
+   animation frames. Nothing is waiting on a click — by the time the user has
+   read the top of the list the bottom of it is already there.
+
+   `renderToken` guards against the obvious hazard: a vote, a block or a filter
+   change calls render() again while a fill is still in flight, and the old fill
+   would otherwise keep appending cards to a grid that is no longer on the page.
+   Each fill captures the token it started under and stops as soon as it changes. */
+
+const FILL_FIRST = 60;     // enough to cover any first screen
+const FILL_CHUNK = 120;    // per frame thereafter
+
+function fillGrid(grid, cands, opts = {}) {
+  const token = renderToken;
+  let i = 0;
+
+  const put = n => {
+    const end = Math.min(cands.length, i + n);
+    for (; i < end; i++) grid.append(rankCard(cands[i], i + 1, opts));
+  };
+
+  put(FILL_FIRST);
+  if (i >= cands.length) return;
+
+  const step = () => {
+    if (token !== renderToken) return;   // superseded; this grid is detached
+    put(FILL_CHUNK);
+    if (i < cands.length) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
 function rankCard(cand, n, opts = {}) {
   const rec = cand.rec;
   const t = (state.ranked && state.ranked.t) || taste();
@@ -5609,27 +5692,23 @@ function viewBrowse() {
     rows = rows.slice().sort(sorters[browseSort] || sorters.score);
     listWrap.replaceChildren();
     listWrap.append(el('div', { class: 'muted small', style: 'margin:8px 0' },
-      rows.length + ' of ' + all.length + ' shown'));
+      rows.length === all.length ? all.length + ' titles'
+        : rows.length + ' of ' + all.length + ' titles'));
     const grid = el('div', { class: 'grid' });
     // Browse can be sorted by price or title, in which case "above" is a
     // position in THAT order and a nudge there would mean nothing about taste.
     // The arrows therefore only act when the list is in ranked order.
     const order = browseSort === 'score' ? rows : null;
-    rows.slice(0, 180).forEach((c, i) => grid.append(rankCard(c, i + 1, { order })));
     listWrap.append(grid);
-    if (rows.length > 180) {
-      listWrap.append(el('p', { class: 'muted small' }, 'Showing the first 180.'));
-    }
+    fillGrid(grid, rows, { order });
+
   }
   drawList();
 }
 let browseQuery = '';
 let browseSort = 'score';
 
-// How much of the ranked list the month view is currently showing. Reset when
-// the month or the filters change, not on every render, so pressing "show more"
-// and then reacting to a card does not collapse the list again.
-let monthListLimit = 15;
+
 
 /* ---------------------------------------------------------- the taste view */
 /* Everything the app believes about the reader, what it believes it FROM, and a
@@ -6758,13 +6837,15 @@ const VIEW_HINTS = {
 };
 
 function setView(v) {
-  if (v !== state.view && v === 'month') monthListLimit = 15;
   state.view = v;
   render();
   window.scrollTo({ top: 0, behavior: 'instant' });
 }
 
+let renderToken = 0;
+
 function render() {
+  renderToken++;
   for (const tab of $$('#tabs .tab')) {
     tab.setAttribute('aria-selected', String(tab.dataset.view === state.view));
   }

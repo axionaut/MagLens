@@ -26,6 +26,11 @@ spot.
 Static: `index.html` + `styles.css` + `app.js`. No build step, no dependencies,
 no backend, no accounts, nothing paid.
 
+MagLens is one page: a ranked list of every magazine that clears your filters,
+and a duel at the top that teaches it what you like. The inspection views that
+grew around it — Browse, Research, History, Taste — were removed in v10; what is
+worth seeing is on the card or behind Details.
+
 ## Run it
 
 ```sh
@@ -91,6 +96,19 @@ a fixed budget (90 page reads by default) where a read changes the answer:
 
 Coverage therefore grows month over month, and Research → Coverage says exactly
 how far it has got.
+
+## Reading what a magazine actually says
+
+Topics used to come from cover lines and a shelf category — what an issue
+advertises about itself. MagLens now reads one real article per issue: the
+opening paragraphs before the paywall, plus the “more from this issue” block that
+carries about ten sibling articles with their standfirsts. One request buys the
+prose of one piece and a summary of ten more.
+
+It matters. On a live India Today issue, cover lines alone made it look like an
+art-and-food magazine (art 11%, food 10%); one article read moved it to finance
+16%, politics 7%, economy 6% — and surfaced economy, finance and manufacturing,
+which were invisible before.
 
 ## Understanding an issue, not a category
 

@@ -47,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 9;
+const APP_VERSION = 10;
 
 /* ============================================================== constants  */
 
@@ -368,7 +368,6 @@ const state = {
   leads: [],              // titles known to exist but not yet read (see DISCOVERY)
   events: [],             // append-only interaction log
   filters: null,          // hard constraints, user-set only
-  overrides: {},          // manual corrections to learned inferences
   merges: [],             // manual duplicate decisions: {a, b, verdict}
   // Titles the user never wants to see again. A hard gate, not a preference:
   // kept OUT of `filters` deliberately, so that "Reset filters" cannot silently
@@ -383,8 +382,7 @@ const state = {
   // voted up and the voted title went DOWN a place, which is indefensible from
   // a button with an arrow on it. So the vote does two things: it teaches
   // (applyPair, from the adjacent pair) and it asserts a position. This is the
-  // assertion, and it is the same kind of object as `overrides` in the Taste
-  // view — an explicit, visible, reversible user correction that wins.
+  // assertion: an explicit, visible, reversible user correction that wins.
   nudges: {},             // recordId -> additive score delta
   meta: {
     onboarded: false,
@@ -551,7 +549,6 @@ async function loadState() {
       state.meta.filterVersion = 3;
       migratedFilters = true;
     }
-    state.overrides = meta.overrides || {};
     state.merges = meta.merges || [];
     state.blocked = meta.blocked || [];
     state.nudges = meta.nudges || {};
@@ -573,7 +570,7 @@ async function saveState() {
   await idbPut('events', 'all', state.events);
   await idbPut('meta', 'all', {
     meta: state.meta, filters: state.filters,
-    overrides: state.overrides, merges: state.merges,
+    merges: state.merges,
     blocked: state.blocked, nudges: state.nudges,
   });
   // The cache is the one store worth trimming: it is pure performance, it is
@@ -867,6 +864,9 @@ function blankObservation(src, url) {
     title: null, publisher: null, category: null, language: null, frequency: null,
     issueLabel: null, coverUrl: null, publishedAt: null,
     issueDescription: null, magazineDescription: null,
+    // Prose lifted from an actual article in this issue, plus who wrote it. The
+    // first text in the app written BY the magazine rather than about it.
+    articleProse: null, byline: null,
     toc: [], recentIssues: [], offers: [],
     formats: [], availability: 'unknown', problems: [],
   };
@@ -931,6 +931,34 @@ const MAGZTER = {
     };
   },
 
+  // One article from the issue, read in full. Deliberately one and not ten: the
+  // story page carries a "more from this issue" block of about ten siblings with
+  // their standfirsts, so a single request buys the prose of one piece AND a
+  // summary of the rest. Ten requests would buy almost nothing more and would
+  // cost ten times the budget.
+  //
+  // The longest piece is chosen rather than the first. A two-minute front-of-book
+  // item is a caption; the long read is what the magazine is actually for, and it
+  // is the piece that says what kind of magazine this is.
+  async readOneStory(obs) {
+    const withUrl = (obs.toc || []).filter(t => t.url);
+    if (!withUrl.length) return;
+    withUrl.sort((a, b) => (b.mins || 0) - (a.mins || 0));
+    const page = await fetchPage(withUrl[0].url, { ttl: TTL.detail });
+    if (!page.text) { obs.problems.push('article text unavailable'); return; }
+    const st = parseMagzterStory(page.text);
+    obs.articleProse = st.prose || null;
+    obs.byline = st.byline;
+    if (st.publishedAt && !obs.publishedAt) obs.publishedAt = st.publishedAt;
+    // Siblings join the contents list, which is what the topic miner reads. They
+    // are marked so their origin stays visible.
+    const have = new Set((obs.toc || []).map(t => (t.title || '').toLowerCase()));
+    for (const sib of st.siblings) {
+      if (have.has(sib.title.toLowerCase())) continue;
+      obs.toc.push({ ...sib, url: null, viaStory: true });
+    }
+  },
+
   async detail(stub) {
     const page = await fetchPage(stub.url, { ttl: stub.hot ? TTL.detailHot : TTL.detail });
     const obs = blankObservation(this, stub.url);
@@ -944,7 +972,9 @@ const MAGZTER = {
       return obs;
     }
     if (page.stale) obs.problems.push('served from a stale cache — every live route failed');
-    return parseMagzterPage(page.text, stub, obs);
+    parseMagzterPage(page.text, stub, obs);
+    await this.readOneStory(obs);
+    return obs;
   },
 };
 
@@ -1174,6 +1204,59 @@ function magzterThumb(url) {
   if (!url || url.indexOf('files.magzter.com') < 0) return url;
   return String(url).replace(MAGZTER_SIZE_RE, '/thumb/1.jpg');
 }
+
+/* ------------------------------------------------------- reading the issue */
+/* Until now the app judged a magazine on its cover lines and a shelf category —
+   what the issue ADVERTISES about itself. A story page carries what it actually
+   says, and two things are on it:
+
+     1. the opening paragraphs of a real article, before the paywall cut. This is
+        the first prose in the app written by the magazine rather than about it,
+        and it is what makes "does this align with my interests" answerable on
+        evidence instead of on keywords in a headline;
+     2. a "more from this issue" block of roughly ten sibling articles, each with
+        a headline and a full standfirst.
+
+   The second is what makes this affordable. One request yields ten more article
+   summaries, so reading an issue properly costs one fetch, not ten — which is
+   why every issue the budget touches can have one rather than only the
+   shortlist. */
+
+function parseMagzterStory(text) {
+  const out = { prose: '', byline: null, publishedAt: null, siblings: [] };
+
+  const pub = /^Published Time:\s*(.+)$/m.exec(text);
+  if (pub) { const d = Date.parse(pub[1]); if (!isNaN(d)) out.publishedAt = d; }
+
+  const by = /^-\s*([A-Z][A-Z.\s]{2,40})$/m.exec(text);
+  if (by) out.byline = by[1].trim();
+
+  // The body runs to the paywall line; everything after it is promotional.
+  const cut = text.indexOf('This story is from the');
+  const body = cut > 0 ? text.slice(0, cut) : text;
+  out.prose = body.split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 90)
+    .filter(l => !l.startsWith('[') && !l.startsWith('!') && !l.startsWith('#'))
+    .filter(l => l.indexOf('](') < 0)
+    .join(' ')
+    .slice(0, 6000);
+
+  // Siblings. The headline and its reading-time marker sit in one run of text,
+  // so this has to be matched across the whole page rather than per block.
+  const re = /##\s+([^\n]+?)\s+!\[Image \d+: time to read\]\([^)]*\)\s*(\d+)\s*mins?/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const whole = m[1].trim();
+    const capRun = /^([A-Z0-9][A-Z0-9 '’&.,:!?()\-–—/]{3,}?)(?=\s+[A-Z][a-z])/.exec(whole);
+    const title = capRun ? capRun[1].trim() : whole.slice(0, 120).trim();
+    const blurb = capRun ? whole.slice(capRun[1].length).trim() : '';
+    if (title) out.siblings.push({ title, blurb, mins: +m[2] });
+    if (out.siblings.length >= 14) break;
+  }
+  return out;
+}
+
 
 function pickMagzterCover(text, obs) {
   const bare = /(^|[^(\[])!\[Image \d+:[^\]]*\]\((https:\/\/files\.magzter\.com\/resize\/magazine\/[^)]+)\)/m.exec(text);
@@ -1502,6 +1585,34 @@ const READWHERE = {
     }
     if (ctx && ctx.note) ctx.note('Readwhere: ' + stubs.length + ' Indian titles with rupee pricing');
     return { stubs, at: at || Date.now(), error: stubs.length ? null : err };
+  },
+
+  // One article from the issue, read in full. Deliberately one and not ten: the
+  // story page carries a "more from this issue" block of about ten siblings with
+  // their standfirsts, so a single request buys the prose of one piece AND a
+  // summary of the rest. Ten requests would buy almost nothing more and would
+  // cost ten times the budget.
+  //
+  // The longest piece is chosen rather than the first. A two-minute front-of-book
+  // item is a caption; the long read is what the magazine is actually for, and it
+  // is the piece that says what kind of magazine this is.
+  async readOneStory(obs) {
+    const withUrl = (obs.toc || []).filter(t => t.url);
+    if (!withUrl.length) return;
+    withUrl.sort((a, b) => (b.mins || 0) - (a.mins || 0));
+    const page = await fetchPage(withUrl[0].url, { ttl: TTL.detail });
+    if (!page.text) { obs.problems.push('article text unavailable'); return; }
+    const st = parseMagzterStory(page.text);
+    obs.articleProse = st.prose || null;
+    obs.byline = st.byline;
+    if (st.publishedAt && !obs.publishedAt) obs.publishedAt = st.publishedAt;
+    // Siblings join the contents list, which is what the topic miner reads. They
+    // are marked so their origin stays visible.
+    const have = new Set((obs.toc || []).map(t => (t.title || '').toLowerCase()));
+    for (const sib of st.siblings) {
+      if (have.has(sib.title.toLowerCase())) continue;
+      obs.toc.push({ ...sib, url: null, viaStory: true });
+    }
   },
 
   async detail(stub) {
@@ -2576,6 +2687,10 @@ const SUBJECTS = [
 // Subjects that are inherently about the news cycle. The brief asks for
 // news-heaviness to be a dimension of its own rather than one topic among many,
 // because "I want a magazine but not more news" is a real and common filter.
+// The ontology names, as a set. Used to tell a real subject from a mined
+// phrase, which matters wherever 'what is this magazine about' is asked.
+const SUBJECT_NAMES = new Set(SUBJECTS.map(s => s[0]));
+
 const NEWSY_SUBJECTS = new Set(['news', 'politics', 'world-affairs', 'economy', 'defence', 'law', 'society']);
 
 // Words that say who a magazine is for. Kept apart from subjects because
@@ -2654,6 +2769,8 @@ function contentSources(rec, obs) {
     toc,
     coverLines: toc.map(t => t.title).filter(Boolean),
     blurbs: toc.map(t => t.blurb).filter(Boolean),
+    articleProse: obs.map(o => o.articleProse).filter(Boolean).join(' ').slice(0, 8000) || null,
+    bylines: obs.map(o => o.byline).filter(Boolean),
     issueDescription: (obs.find(o => o.issueDescription) || {}).issueDescription || null,
     magazineDescription: (obs.find(o => o.magazineDescription) || {}).magazineDescription || null,
     category: rec.category,
@@ -2686,6 +2803,9 @@ function analyseContent(rec, obs) {
   // count without any special-casing in the matchers.
   const parts = [];
   const push = (text, weight) => { for (let i = 0; i < weight; i++) if (text) parts.push(String(text)); };
+  // Real article prose outweighs everything else on the page. A cover line is
+  // written to sell the issue; this is the issue.
+  push(src.articleProse, 5);
   push(src.coverLines.join(' . '), 4);
   push(src.blurbs.join(' . '), 2);
   push(src.issueDescription, 3);
@@ -3546,7 +3666,6 @@ function finaliseTaste(model) {
       difficulty: scalarView(model.difficulty, 'reading difficulty'),
       newsiness:  scalarView(model.newsiness, 'news content'),
     },
-    overrides: state.overrides,
   };
 
   for (const [name, a] of Object.entries(model.topics)) {
@@ -3608,43 +3727,14 @@ function finaliseTaste(model) {
 
   view.diversityPressure = model.diversityPressure;
 
-  applyOverrides(view);
   return view;
 }
 
-// Manual corrections. Three shapes, all reversible, none of them touching the
-// event log: mute a topic entirely, pin it to a value, or delete the evidence
-// behind it (which is done by removing the events, not by patching the model).
-function applyOverrides(view) {
-  for (const [key, ov] of Object.entries(state.overrides || {})) {
-    const [kind, ...rest] = key.split(':');
-    const name = rest.join(':');
-    if (kind === 'topic' && view.topics[name]) {
-      if (ov.mode === 'mute') { view.topics[name].utility = 0; view.topics[name].muted = true; }
-      if (ov.mode === 'set') view.topics[name].utility = +ov.value;
-      view.topics[name].overridden = true;
-      view.topics[name].overrideNote = ov.note || null;
-    } else if (kind === 'topic' && ov.mode === 'set') {
-      // A topic the user asserted before any evidence existed for it.
-      view.topics[name] = {
-        name, utility: +ov.value, pos: 0, neg: 0, weight: 0,
-        confidence: 0.5, evidence: [], overridden: true, manualOnly: true,
-        overrideNote: ov.note || null,
-      };
-    } else if (kind === 'scalar' && view.scalars[name]) {
-      view.scalars[name] = { ...view.scalars[name], known: true, mean: +ov.value, overridden: true, sd: 0.14 };
-    } else if (kind === 'progression') {
-      view.progression.appetite = +ov.value;
-      view.progression.overridden = true;
-      view.progression.stride = ov.value < 0.38 ? 'familiar' : ov.value < 0.62 ? 'adjacent' : 'exploratory';
-    }
-  }
-}
 
 let tasteCache = { key: '', value: null };
 function taste() {
   const key = state.events.reduce((a, e) => a + (e.kind === 'view' ? 0 : 1), 0)
-    + '|' + JSON.stringify(state.overrides) + '|' + state.magazines.size;
+    + '|' + state.magazines.size;
   if (tasteCache.key === key) return tasteCache.value;
   tasteCache = { key, value: buildTaste() };
   return tasteCache.value;
@@ -4248,6 +4338,35 @@ function describeFit(terms) {
 // nobody reads.
 const DIVERSITY_DEPTH = 120;
 
+// How many rows at the very top are guaranteed to be about DIFFERENT subjects.
+//
+// The overlap penalty below is a gradient: it makes similar things cost more,
+// but a subject the model is confident about can pay that cost over and over
+// and still win, so the top of the list drifts into six variations on one
+// theme. That is the rut this app exists to avoid, and a penalty large enough
+// to prevent it would also wreck the ranking further down.
+//
+// So the first rows are a mix BY CONSTRUCTION rather than by pressure: once a
+// subject has taken a place in the top ROTATION_DEPTH, the next pick has to
+// come from somewhere else. It costs nothing in the common case — a good list
+// is already varied — and it binds exactly when the ranking is about to repeat
+// itself. Below the depth, ordinary scoring resumes: a reader who genuinely
+// wants four car magazines can still find them, just not as the whole answer to
+// "what should I buy this month".
+const ROTATION_DEPTH = 12;
+
+// The subject a magazine is mostly about, which is what a reader would say it
+// "is". Mined phrases are skipped: they are specific to one issue and two
+// magazines sharing one is a coincidence, not a repetition.
+function primarySubject(rec) {
+  let best = null, bestShare = 0;
+  for (const [name, share] of Object.entries(rec.topics || {})) {
+    if (!SUBJECT_NAMES.has(name)) continue;
+    if (share > bestShare) { bestShare = share; best = name; }
+  }
+  return bestShare >= 0.12 ? best : null;
+}
+
 function selectShortlist(scored, t, f, count) {
   const chosen = [];
 
@@ -4265,6 +4384,7 @@ function selectShortlist(scored, t, f, count) {
   const worstSim = new Float64Array(pool.length);      // closest already-chosen
   const worstAgainst = new Array(pool.length).fill(null);
   const pubCount = new Map();
+  const usedSubjects = new Set();
 
   const depth = Math.min(count, DIVERSITY_DEPTH);
   const tol = f.overlapTolerance;
@@ -4284,8 +4404,24 @@ function selectShortlist(scored, t, f, count) {
       // Title-level variety too: the same publisher three times in a shortlist
       // reads as a rut even when the subjects differ.
       const pubPenalty = (pubCount.get(cand.rec.publisher) || 0) * 0.35;
+      // Inside the rotation depth a subject already spoken for is skipped
+      // outright rather than merely taxed. Skipped, not scored down, because a
+      // penalty is something a strong candidate can buy its way through and the
+      // whole point here is that it cannot.
+      if (picked < ROTATION_DEPTH) {
+        const subj = primarySubject(cand.rec);
+        if (subj && usedSubjects.has(subj)) continue;
+      }
       const s = cand.base - penalty - pubPenalty;
       if (s > bestScore) { bestScore = s; bestIdx = i; }
+    }
+    // Every remaining candidate repeats a subject already in the top rows. The
+    // rotation has done its job and now stands aside rather than truncating the
+    // list — the reader asked for the whole shelf, not twelve titles.
+    if (bestIdx < 0 && picked < ROTATION_DEPTH) {
+      usedSubjects.clear();
+      picked--;               // retry this slot with the constraint lifted
+      continue;
     }
     if (bestIdx < 0) break;
 
@@ -4304,6 +4440,11 @@ function selectShortlist(scored, t, f, count) {
       : 'first pick — nothing to overlap with';
     pick.overlap = { overlap: worstSim[bestIdx], against: worstAgainst[bestIdx], penalty: total, samePub };
     if (pick.rec.publisher) pubCount.set(pick.rec.publisher, samePub + 1);
+    const subj = primarySubject(pick.rec);
+    if (subj) {
+      if (chosen.length < ROTATION_DEPTH) usedSubjects.add(subj);
+      pick.notes.diversity += ' · leads on ' + subj;
+    }
     chosen.push(pick);
 
     // The one update that replaces the inner rescan: every remaining candidate
@@ -4441,6 +4582,13 @@ function rankAll(opts = {}) {
   return { primary, alternatives, chosen, scored, excluded, t, ctx, f, month };
 }
 
+
+/* ------------------------------------------------------- the monthly cycle */
+/* Recomputed from whatever is currently known, every month, with no memory of
+   what last month decided beyond the history that should influence it. There is
+   no stored schedule to repeat, because a schedule made in August cannot know
+   that September's issue is a rerun or that the title has gone out of print. */
+
 function comparison(better, worse) {
   const diffs = Object.keys(WEIGHTS).map(k => ({
     part: k,
@@ -4475,12 +4623,6 @@ function comparison(better, worse) {
   };
 }
 
-/* ------------------------------------------------------- the monthly cycle */
-/* Recomputed from whatever is currently known, every month, with no memory of
-   what last month decided beyond the history that should influence it. There is
-   no stored schedule to repeat, because a schedule made in August cannot know
-   that September's issue is a rerun or that the title has gone out of print. */
-
 function currentCycle() {
   const month = nowMonth();
   const key = String(month);
@@ -4490,7 +4632,7 @@ function currentCycle() {
   // model, the headline pick changed each time the page was drawn.
   const rankKey = [
     month, state.events.reduce((a, e) => a + (e.kind === 'view' ? 0 : 1), 0), state.magazines.size,
-    JSON.stringify(state.filters), JSON.stringify(state.overrides),
+    JSON.stringify(state.filters),
     state.meta.exploreRate,
   ].join('|');
 
@@ -4918,6 +5060,93 @@ function corpusFacets() {
   return { topics: sorted(topics), languages: sorted(languages), freqs: sorted(freqs), cats: sorted(cats) };
 }
 
+function factRow(rec) {
+  const c = rec.content || {};
+  const row = el('div', { class: 'factRow' });
+
+  const price = rec.price || {};
+  const priceCls = price.basis === 'single-issue' && price.confidence > 0.8 ? ''
+    : price.basis === 'none' ? 'warn' : 'warn';
+  row.append(el('span', { class: 'fact ' + priceCls, title: price.note || '' },
+    price.amount == null ? 'Price unknown' : el('b', {}, fmtPrice(price)),
+    price.amount != null && price.basis !== 'single-issue' ? ' per issue (derived)' : ''));
+
+  row.append(el('span', { class: 'fact' }, (rec.formats || []).length
+    ? (rec.formats.map(f => f[0].toUpperCase() + f.slice(1)).join(' + '))
+    : 'Format unknown'));
+
+  if (rec.frequency && rec.frequency.label) row.append(el('span', { class: 'fact' }, rec.frequency.label));
+  if (rec.language) row.append(el('span', { class: 'fact' }, rec.language));
+  if (c.audience) row.append(el('span', { class: 'fact', title: c.audienceWhy || '' }, audienceWord(c.audience)));
+  if (c.visualness != null) {
+    row.append(el('span', {
+      class: 'fact' + (c.visualConfidence < 0.25 ? ' warn' : ''),
+      title: 'How this was judged: ' + (c.visualBasis || 'unknown'),
+    }, visualWord(c.visualness), c.visualConfidence < 0.25 ? el('b', {}, ' ?') : ''));
+  }
+  if (c.difficulty != null) row.append(el('span', { class: 'fact' }, difficultyWord(c.difficulty) + ' read'));
+  if (c.newsiness != null) row.append(el('span', {
+    class: 'fact' + (c.newsiness > 0.55 ? ' warn' : ''),
+  }, newsWord(c.newsiness)));
+  row.append(confidenceFact(rec));
+  return row;
+}
+
+function confidenceFact(rec) {
+  const iss = rec.issue || {};
+  const cls = iss.band === 'verified' ? 'good' : iss.band === 'likely' ? '' :
+              iss.band === 'uncertain' ? 'warn' : 'bad';
+  const text = {
+    verified: 'Confirmed current issue',
+    likely: 'Probably the current issue',
+    uncertain: 'Current issue uncertain',
+    unknown: 'Current issue unknown',
+  }[iss.band] || 'Current issue unknown';
+  return el('span', {
+    class: 'fact ' + cls,
+    title: (iss.reasons || []).join('\n'),
+  }, text, ' ', el('b', {}, Math.round((iss.confidence || 0) * 100) + '%'));
+}
+
+function multiSelect(label, options, selected, onchange, hint) {
+  const sel = el('select', { multiple: true, size: Math.min(6, Math.max(3, options.length)) });
+  for (const [value, count] of options) {
+    const o = el('option', { value }, value + (count ? ' (' + count + ')' : ''));
+    if (selected.includes(value)) o.selected = true;
+    sel.append(o);
+  }
+  sel.addEventListener('change', () =>
+    onchange(Array.from(sel.selectedOptions).map(o => o.value)));
+  return el('label', { class: 'field' }, el('span', {}, label), sel,
+    hint ? el('small', { class: 'muted' }, hint) : null);
+}
+
+function whereBox(rec) {
+  const box = el('div', { class: 'why' });
+  box.append(el('h4', {}, 'Where to get it'));
+  if (!rec.offers.length) {
+    box.append(el('p', { class: 'muted small' },
+      'No purchase option was readable. The title is listed at ' +
+      (rec.urls || []).length + ' source(s) — open Details to follow them.'));
+    return box;
+  }
+  const list = el('div', { class: 'srcList' });
+  for (const o of rec.offers.slice(0, 5)) {
+    list.append(el('div', { class: 'srcRow' },
+      el('div', {},
+        el('a', { href: o.sourceUrl || o.url, target: '_blank', rel: 'noopener' }, o.seller),
+        ' — ', el('b', {}, fmtPrice(o)),
+        o.kind === 'single' ? ' for this issue' : ' for ' + o.issues + ' issues',
+        o.storeRegion && o.storeRegion !== 'IN'
+          ? el('span', { class: 'muted' }, ' · read from the ' + o.storeRegion + ' store')
+          : null,
+        o.inferred ? el('span', { class: 'muted' }, ' · inferred') : null),
+      el('span', { class: 'when' }, ago(o.at))));
+  }
+  box.append(list);
+  return box;
+}
+
 function coverNode(rec, opts = {}) {
   const box = el('div', { class: 'coverBox' });
   if (rec.coverUrl) {
@@ -4968,55 +5197,8 @@ function topicChips(topics, opts = {}) {
   }
   return wrap;
 }
-const SUBJECT_NAMES = new Set(SUBJECTS.map(s => s[0]));
 
-function confidenceFact(rec) {
-  const iss = rec.issue || {};
-  const cls = iss.band === 'verified' ? 'good' : iss.band === 'likely' ? '' :
-              iss.band === 'uncertain' ? 'warn' : 'bad';
-  const text = {
-    verified: 'Confirmed current issue',
-    likely: 'Probably the current issue',
-    uncertain: 'Current issue uncertain',
-    unknown: 'Current issue unknown',
-  }[iss.band] || 'Current issue unknown';
-  return el('span', {
-    class: 'fact ' + cls,
-    title: (iss.reasons || []).join('\n'),
-  }, text, ' ', el('b', {}, Math.round((iss.confidence || 0) * 100) + '%'));
-}
 
-function factRow(rec) {
-  const c = rec.content || {};
-  const row = el('div', { class: 'factRow' });
-
-  const price = rec.price || {};
-  const priceCls = price.basis === 'single-issue' && price.confidence > 0.8 ? ''
-    : price.basis === 'none' ? 'warn' : 'warn';
-  row.append(el('span', { class: 'fact ' + priceCls, title: price.note || '' },
-    price.amount == null ? 'Price unknown' : el('b', {}, fmtPrice(price)),
-    price.amount != null && price.basis !== 'single-issue' ? ' per issue (derived)' : ''));
-
-  row.append(el('span', { class: 'fact' }, (rec.formats || []).length
-    ? (rec.formats.map(f => f[0].toUpperCase() + f.slice(1)).join(' + '))
-    : 'Format unknown'));
-
-  if (rec.frequency && rec.frequency.label) row.append(el('span', { class: 'fact' }, rec.frequency.label));
-  if (rec.language) row.append(el('span', { class: 'fact' }, rec.language));
-  if (c.audience) row.append(el('span', { class: 'fact', title: c.audienceWhy || '' }, audienceWord(c.audience)));
-  if (c.visualness != null) {
-    row.append(el('span', {
-      class: 'fact' + (c.visualConfidence < 0.25 ? ' warn' : ''),
-      title: 'How this was judged: ' + (c.visualBasis || 'unknown'),
-    }, visualWord(c.visualness), c.visualConfidence < 0.25 ? el('b', {}, ' ?') : ''));
-  }
-  if (c.difficulty != null) row.append(el('span', { class: 'fact' }, difficultyWord(c.difficulty) + ' read'));
-  if (c.newsiness != null) row.append(el('span', {
-    class: 'fact' + (c.newsiness > 0.55 ? ' warn' : ''),
-  }, newsWord(c.newsiness)));
-  row.append(confidenceFact(rec));
-  return row;
-}
 
 function actionRow(cand, opts = {}) {
   const rec = cand.rec;
@@ -5031,27 +5213,9 @@ function actionRow(cand, opts = {}) {
   if (!opts.noSkip) {
     row.append(el('button', { class: 'ghost', onclick: () => openReject(rec, 'skip') }, 'Skip this month'));
   }
-  row.append(ratingWidget(rec));
   return row;
 }
 
-function ratingWidget(rec) {
-  const wrap = el('span', { class: 'chipWrap', style: 'align-items:center;gap:4px' });
-  wrap.append(el('span', { class: 'muted small', style: 'margin-right:2px' }, 'Rate:'));
-  const existing = state.events.filter(e => e.kind === 'rate' && e.recordId === rec.id).slice(-1)[0];
-  for (let i = 1; i <= 5; i++) {
-    wrap.append(el('button', {
-      class: 'tiny' + (existing && existing.rating >= i ? ' primary' : ' ghost'),
-      title: i + ' of 5',
-      onclick: () => {
-        recordEvent('rate', rec, { rating: i });
-        toast('Rated ' + i + '/5 — this is weighted heavily');
-        render();
-      },
-    }, String(i)));
-  }
-  return wrap;
-}
 
 /* --------------------------------------------------------- the month view */
 
@@ -5102,8 +5266,6 @@ function viewMonth() {
   for (const c of r.chosen.slice(0, 3)) markViewed(c.rec);
 
 
-  main.append(el('h2', { class: 'sec' }, 'How this month was worked out'));
-  main.append(cycleSummary(r));
 }
 
 const viewedThisSession = new Set();
@@ -5116,90 +5278,8 @@ function markViewed(rec) {
   if (!already) recordEvent('view', rec);
 }
 
-function whyBox(cand, r) {
-  const box = el('div', { class: 'why' });
-  box.append(el('h4', {}, 'Why it sits where it does'));
-  const ul = el('ul', {});
 
-  // Callable from the detail modal, which may be opened before any ranking has
-  // been computed in this session.
-  const t = (r && r.t) || taste();
-  if (t.empty) {
-    ul.append(el('li', {}, 'You have not taught it anything yet, so this is ',
-      el('b', {}, 'not'), ' a taste match — it is the strongest available issue that clears your filters.'));
-  } else {
-    ul.append(el('li', {}, el('b', {}, 'Fits your tastes: '), cand.fit.note || 'no strong signal either way',
-      ' (', Math.round(cand.parts.prefFit * 100), '%)'));
-  }
 
-  ul.append(el('li', {}, el('b', {}, 'Current issue: '), cand.notes.freshness));
-  ul.append(el('li', {}, el('b', {}, 'Availability: '), cand.notes.availability));
-  ul.append(el('li', {}, el('b', {}, 'Price: '), cand.notes.valueFit));
-  if (cand.parts.repetition > 0.3) {
-    ul.append(el('li', {}, el('b', {}, 'Repetition: '), cand.notes.repetition,
-      ' — this counted against it and it still came top.'));
-  }
-  if (!t.empty && cand.parts.progression != null) {
-    ul.append(el('li', {}, el('b', {}, 'Step size: '), cand.notes.progression));
-  }
-  if (cand.exploratory) ul.append(el('li', {}, el('b', {}, 'Exploratory: '), cand.exploreReason));
-  box.append(ul);
-
-  const rel = cand.beats || cand.below;
-  if (rel) {
-    box.append(el('h4', {}, 'Against ' + rel.against));
-    const ul2 = el('ul', {});
-    for (const rsn of rel.reasons) {
-      ul2.append(el('li', {}, rsn.text, ' ',
-        el('span', { class: 'muted mono' }, (rsn.delta > 0 ? '+' : '') + rsn.delta.toFixed(2))));
-    }
-    if (!rel.reasons.length) {
-      ul2.append(el('li', {}, 'The two are within a rounding error of each other — either would do.'));
-    }
-    box.append(ul2);
-  }
-  return box;
-}
-
-function whereBox(rec) {
-  const box = el('div', { class: 'why' });
-  box.append(el('h4', {}, 'Where to get it'));
-  if (!rec.offers.length) {
-    box.append(el('p', { class: 'muted small' },
-      'No purchase option was readable. The title is listed at ' +
-      (rec.urls || []).length + ' source(s) — open Details to follow them.'));
-    return box;
-  }
-  const list = el('div', { class: 'srcList' });
-  for (const o of rec.offers.slice(0, 5)) {
-    list.append(el('div', { class: 'srcRow' },
-      el('div', {},
-        el('a', { href: o.sourceUrl || o.url, target: '_blank', rel: 'noopener' }, o.seller),
-        ' — ', el('b', {}, fmtPrice(o)),
-        o.kind === 'single' ? ' for this issue' : ' for ' + o.issues + ' issues',
-        o.storeRegion && o.storeRegion !== 'IN'
-          ? el('span', { class: 'muted' }, ' · read from the ' + o.storeRegion + ' store')
-          : null,
-        o.inferred ? el('span', { class: 'muted' }, ' · inferred') : null),
-      el('span', { class: 'when' }, ago(o.at))));
-  }
-  box.append(list);
-  return box;
-}
-
-// Uncertainty is shown, never smoothed over. Everything a source could not
-// establish is listed here rather than being allowed to look like a fact.
-function uncertaintyBox(rec) {
-  const box = el('div', { class: 'why' });
-  box.append(el('h4', {}, 'What could not be established'));
-  const ul = el('ul', {});
-  for (const p of rec.problems.slice(0, 6)) ul.append(el('li', { class: 'muted' }, p));
-  for (const c of rec.conflicts || []) {
-    ul.append(el('li', { class: 'muted' }, 'Sources disagree on ' + c.field + ': ' + c.values.join(' vs ')));
-  }
-  box.append(ul);
-  return box;
-}
 
 /* ------------------------------------------------------------- voting */
 /* Up and down arrows on every card in the list, ranker.com style: press one and
@@ -5628,42 +5708,6 @@ function comparePanel(r) {
   return panel;
 }
 
-function cycleSummary(r) {
-  const panel = el('div', { class: 'panel' });
-  const counts = state.meta.lastPlan || {};
-  const researched = Array.from(state.magazines.values()).length;
-  panel.append(el('h3', {}, monthLabel(r.month) + ' — recomputed from what is on sale now'));
-  panel.append(el('p', {},
-    'Nothing here is carried over from a previous month’s schedule. The ranking below was rebuilt from '
-    + 'the most recent reading of each title, so a magazine that was suitable last month can drop out '
-    + 'because it went up in price, repeated itself, or could not be confirmed as current.'));
-  const dl = el('dl', { class: 'kv' });
-  const kv = (k, v) => { dl.append(el('dt', {}, k), el('dd', {}, v)); };
-  const ls = leadStats();
-  kv('Listings emitted by the sitemaps', ls.raw.toLocaleString('en-IN'));
-  kv('Distinct titles after deduplication', ls.distinct.toLocaleString('en-IN')
-    + (ls.raw > ls.distinct ? ' (' + (ls.raw - ls.distinct).toLocaleString('en-IN')
-      + ' were the same title on a second shelf)' : ''));
-  kv('Consumer magazines among them', ls.consumer.toLocaleString('en-IN')
-    + ' — ' + ls.journals.toLocaleString('en-IN') + ' academic/coursebook titles excluded');
-  kv('Issues actually read', researched + ' (' + (ls.consumer ? Math.round(researched / ls.consumer * 100) : 0) + '% of the consumer shelf)');
-  kv('Cleared your filters', String(r.scored.length));
-  kv('Excluded', String(r.excluded.length));
-  kv('Last refresh', state.meta.lastRefresh ? ago(state.meta.lastRefresh) + ' (' + (state.meta.lastRefreshSeconds || 0) + 's)' : 'never');
-  if (counts.cachedSkips) {
-    kv('Skipped as already current', counts.cachedSkips
-      + ' titles whose last reading is still within its cache lifetime, so the budget went to unread ones instead');
-  }
-  kv('Taste model', r.t.empty ? 'empty — no interactions recorded'
-    : r.t.eventCount + ' events, ' + Object.keys(r.t.topics).length + ' topics, '
-      + r.t.progression.stride + ' stride');
-  panel.append(dl);
-  panel.append(el('div', { class: 'btnRow', style: 'margin-top:12px' },
-    el('button', { class: 'ghost', onclick: () => setView('research') }, 'Open the research view'),
-    el('button', { class: 'ghost', onclick: () => runRefresh({ budget: Math.max(150, state.meta.budget * 2) }) },
-      'Deep refresh (double budget)')));
-  return panel;
-}
 
 function emptyState() {
   return el('div', { class: 'empty' },
@@ -5676,69 +5720,6 @@ function emptyState() {
 
 /* --------------------------------------------------------- the browse view */
 
-function viewBrowse() {
-  const main = $('#main');
-  main.replaceChildren();
-
-  const r = currentCycle();
-  const all = r.scored.slice();
-
-  main.append(el('h2', { class: 'sec' }, 'Everything that clears your filters'));
-
-  const bar = el('div', { class: 'panel' });
-  const search = el('input', {
-    type: 'search', placeholder: 'title, publisher, topic…',
-    oninput: e => { browseQuery = e.target.value.toLowerCase(); drawList(); },
-    value: browseQuery,
-  });
-  const sortSel = el('select', {
-    onchange: e => { browseSort = e.target.value; drawList(); },
-  },
-    el('option', { value: 'score' }, 'Best fit first'),
-    el('option', { value: 'fresh' }, 'Most confidently current'),
-    el('option', { value: 'price' }, 'Cheapest first'),
-    el('option', { value: 'new' }, 'Most recently read'),
-    el('option', { value: 'title' }, 'A–Z'));
-  sortSel.value = browseSort;
-  bar.append(el('div', { class: 'deckGrid' },
-    el('label', { class: 'field' }, el('span', {}, 'Search'), search),
-    el('label', { class: 'field' }, el('span', {}, 'Sort'), sortSel)));
-  main.append(bar);
-
-  const listWrap = el('div', {});
-  main.append(listWrap);
-
-  function drawList() {
-    let rows = all;
-    if (browseQuery) {
-      rows = rows.filter(c => (c.rec.title + ' ' + (c.rec.publisher || '') + ' '
-        + Object.keys(c.rec.topics || {}).join(' ')).toLowerCase().includes(browseQuery));
-    }
-    const sorters = {
-      score: (a, b) => b.base - a.base,
-      fresh: (a, b) => (b.rec.issue.confidence || 0) - (a.rec.issue.confidence || 0),
-      price: (a, b) => (toInr(a.rec.price) ?? 1e9) - (toInr(b.rec.price) ?? 1e9),
-      new: (a, b) => b.rec.lastChecked - a.rec.lastChecked,
-      title: (a, b) => a.rec.title.localeCompare(b.rec.title),
-    };
-    rows = rows.slice().sort(sorters[browseSort] || sorters.score);
-    listWrap.replaceChildren();
-    listWrap.append(el('div', { class: 'muted small', style: 'margin:8px 0' },
-      rows.length === all.length ? all.length + ' titles'
-        : rows.length + ' of ' + all.length + ' titles'));
-    const grid = el('div', { class: 'grid' });
-    // Browse can be sorted by price or title, in which case "above" is a
-    // position in THAT order and a nudge there would mean nothing about taste.
-    // The arrows therefore only act when the list is in ranked order.
-    const order = browseSort === 'score' ? rows : null;
-    listWrap.append(grid);
-    fillGrid(grid, rows, { order });
-
-  }
-  drawList();
-}
-let browseQuery = '';
-let browseSort = 'score';
 
 
 
@@ -5748,152 +5729,7 @@ let browseSort = 'score';
    evidence behind it is indistinguishable from a guess, and a system that
    cannot be corrected will eventually be wrong in a way that compounds. */
 
-function viewTaste() {
-  const main = $('#main');
-  main.replaceChildren();
-  const t = taste();
 
-  if (t.empty) {
-    main.append(el('div', { class: 'empty' },
-      el('h3', {}, 'Nothing learned yet — by design'),
-      el('p', {}, 'MagLens was not seeded with any topics, interests, categories or example magazines. '
-        + 'This page fills itself in from what you actually do: what you buy, rate, like, dismiss and '
-        + 'give reasons for. Until then it stays empty rather than guessing, and the monthly shortlist '
-        + 'is chosen for breadth instead of fit.'),
-      el('button', { class: 'primary', onclick: () => setView('month') }, 'Go and react to something')));
-    return;
-  }
-
-  main.append(el('h2', { class: 'sec' }, 'What MagLens believes about you'));
-  main.append(el('div', { class: 'panel' },
-    el('h3', {}, 'Built from ' + t.eventCount + ' interactions'),
-    el('p', {}, 'Every line below is derived from the event log and nothing else. Change or delete any '
-      + 'of it — the model is rebuilt from scratch each time, so a correction produces exactly the model '
-      + 'that would have existed had the evidence been different. Deleting the evidence itself is done '
-      + 'from History.'),
-    el('p', {}, 'One thing is deliberately excluded: simply being shown a magazine teaches nothing. '
-      + 'It is kept in History so you can see what was put in front of you, but training on it would '
-      + 'mean learning from the recommender’s own output. Dismissing something you were shown is a '
-      + 'different matter and does count.'),
-    el('div', { class: 'kv' },
-      el('dt', {}, 'First signal'), el('dd', {}, fmtDate(t.firstAt)),
-      el('dt', {}, 'Latest signal'), el('dd', {}, fmtDate(t.lastAt)),
-      el('dt', {}, 'Total evidence weight'), el('dd', {}, t.totalWeight.toFixed(1)),
-      el('dt', {}, 'Model maturity'), el('dd', {}, Math.round(t.maturity * 100) + '% — how much '
-        + 'weight the ranking gives these beliefs against everything else it measures'))));
-
-  /* ---- subjects ---- */
-  main.append(el('h2', { class: 'sec' }, 'Subjects'));
-  const subjects = Object.values(t.topics)
-    .filter(x => x.weight > 0.15 || x.overridden)
-    .sort((a, b) => Math.abs(b.utility) * b.confidence - Math.abs(a.utility) * a.confidence);
-
-  const subPanel = el('div', { class: 'panel' });
-  if (!subjects.length) {
-    subPanel.append(el('p', {}, 'No subject has enough evidence behind it to say anything yet.'));
-  }
-  for (const s of subjects.slice(0, 40)) subPanel.append(inferenceRow(s, 'topic'));
-  main.append(subPanel);
-
-  /* ---- how you read ---- */
-  main.append(el('h2', { class: 'sec' }, 'How you read'));
-  const scalarPanel = el('div', { class: 'panel' });
-  const scalarCopy = {
-    visualness: ['mostly pictures', 'mostly words'],
-    difficulty: ['demanding', 'easy'],
-    newsiness: ['news-heavy', 'no news'],
-    price: null,
-  };
-  for (const [key, s] of Object.entries(t.scalars)) {
-    if (!s.known) {
-      scalarPanel.append(el('div', { class: 'inference' },
-        el('div', { class: 'lead' }, el('b', {}, s.label), el('span', { class: 'muted' }, 'not established yet')),
-        el('div', { class: 'ev' }, 'Nothing you have done so far says anything about this.')));
-      continue;
-    }
-    scalarPanel.append(scalarRow(key, s, scalarCopy[key]));
-  }
-  main.append(scalarPanel);
-
-  /* ---- facets ---- */
-  const facetTitles = {
-    audience: 'Audience', languages: 'Languages', publishers: 'Publishers',
-    frequency: 'Publication frequency', formats: 'Format',
-  };
-  for (const [facet, title] of Object.entries(facetTitles)) {
-    const rows = Object.values(t.facets[facet] || {})
-      .filter(x => x.weight > 0.3)
-      .sort((a, b) => Math.abs(b.utility) - Math.abs(a.utility));
-    if (!rows.length) continue;
-    main.append(el('h2', { class: 'sec' }, title));
-    const p = el('div', { class: 'panel' });
-    for (const row of rows.slice(0, 14)) p.append(inferenceRow(row, 'facet:' + facet));
-    main.append(p);
-  }
-
-  /* ---- progression ---- */
-  main.append(el('h2', { class: 'sec' }, 'How far you like to stray'));
-  main.append(progressionPanel(t));
-}
-
-function inferenceRow(s, kind) {
-  const positive = s.utility > 0;
-  const strength = Math.abs(s.utility);
-  const word = strength < 0.25 ? 'barely registers'
-    : strength < 0.7 ? (positive ? 'mildly drawn to' : 'mildly put off by')
-    : strength < 1.4 ? (positive ? 'likes' : 'dislikes')
-    : (positive ? 'strongly likes' : 'strongly dislikes');
-
-  const row = el('div', { class: 'inference' + (s.overridden ? ' overridden' : '') });
-  row.append(el('div', { class: 'lead' },
-    el('b', {}, s.name),
-    el('span', { class: 'muted' }, word),
-    el('span', { class: 'confBar' }, 'confidence',
-      el('span', { class: 'meter' }, el('i', { style: 'width:' + Math.round(s.confidence * 100) + '%' })),
-      Math.round(s.confidence * 100) + '%'),
-    s.muted ? el('span', { class: 'fact bad' }, 'muted') : null,
-    s.overridden && !s.muted ? el('span', { class: 'fact warn' }, 'you corrected this') : null));
-
-  const ctrls = el('div', { class: 'ctrls' });
-  if (kind === 'topic') {
-    ctrls.append(el('button', {
-      class: 'tiny ghost', title: 'Stop this subject influencing recommendations at all',
-      onclick: () => setOverride('topic:' + s.name, { mode: 'mute' }),
-    }, s.muted ? 'Unmute' : 'Mute'));
-    ctrls.append(el('button', {
-      class: 'tiny ghost', title: 'Assert that you do like this, whatever the evidence says',
-      onclick: () => setOverride('topic:' + s.name, { mode: 'set', value: 1.2, note: 'you said you like this' }),
-    }, 'I do like it'));
-    ctrls.append(el('button', {
-      class: 'tiny ghost',
-      onclick: () => setOverride('topic:' + s.name, { mode: 'set', value: -1.2, note: 'you said you dislike this' }),
-    }, 'I don’t'));
-    if (state.overrides['topic:' + s.name]) {
-      ctrls.append(el('button', {
-        class: 'tiny danger', onclick: () => clearOverride('topic:' + s.name),
-      }, 'Undo correction'));
-    }
-  }
-  row.append(ctrls);
-
-  const ev = el('div', { class: 'ev' });
-  if (s.manualOnly) {
-    ev.append(el('em', {}, 'You asserted this directly. There is no interaction evidence behind it.'));
-  } else if (!s.evidence.length) {
-    ev.append('No evidence recorded.');
-  } else {
-    ev.append(el('em', {}, 'Evidence: '));
-    const bits = s.evidence.slice(0, 5).map(e =>
-      (e.sign > 0 ? '+' : '−') + ' ' + evidenceWord(e.kind) + ' ' + (e.title || '')
-      + (e.reason ? ' ("' + e.reason + '")' : '')
-      + (e.share ? ' — ' + Math.round(e.share * 100) + '% of that issue' : '')
-      + ' · ' + ago(e.at));
-    ev.append(bits.join('  ·  '));
-    if (s.evidence.length > 5) ev.append('  · and ' + (s.evidence.length - 5) + ' more');
-  }
-  row.append(ev);
-  return row;
-}
 
 const evidenceWord = k => ({
   buy: 'bought', rate: 'rated', like: 'liked', dislike: 'disliked',
@@ -5901,184 +5737,15 @@ const evidenceWord = k => ({
   view: 'was shown', alreadyRead: 'had already read',
 }[k] || k);
 
-function scalarRow(key, s, poles) {
-  const row = el('div', { class: 'inference' + (s.overridden ? ' overridden' : '') });
-  const value = key === 'price' ? '₹' + Math.round(s.mean)
-    : Math.round(s.mean * 100) + '%' + (poles ? ' towards ' + (s.mean > 0.5 ? poles[0] : poles[1]) : '');
-  row.append(el('div', { class: 'lead' },
-    el('b', {}, s.label),
-    el('span', { class: 'muted' }, value),
-    key !== 'price' && s.sd != null
-      ? el('span', { class: 'muted small' }, '± ' + Math.round(s.sd * 100) + '%')
-      : null,
-    s.avoid != null
-      ? el('span', { class: 'muted small' }, '· avoids ' +
-        (key === 'price' ? '₹' + Math.round(s.avoid) : Math.round(s.avoid * 100) + '%'))
-      : null,
-    el('span', { class: 'confBar' }, 'confidence',
-      el('span', { class: 'meter' }, el('i', { style: 'width:' + Math.round(s.confidence * 100) + '%' })),
-      Math.round(s.confidence * 100) + '%')));
 
-  const ctrls = el('div', { class: 'ctrls' });
-  if (key !== 'price') {
-    const slider = el('input', {
-      type: 'range', min: 0, max: 100, value: Math.round(s.mean * 100),
-      style: 'width:120px',
-      onchange: e => setOverride('scalar:' + key, { mode: 'set', value: +e.target.value / 100 }),
-    });
-    ctrls.append(slider);
-  } else {
-    ctrls.append(el('input', {
-      type: 'number', style: 'width:110px', value: Math.round(s.mean),
-      onchange: e => setOverride('scalar:price', { mode: 'set', value: +e.target.value }),
-    }));
-  }
-  if (state.overrides['scalar:' + key]) {
-    ctrls.append(el('button', { class: 'tiny danger', onclick: () => clearOverride('scalar:' + key) }, 'Undo'));
-  }
-  row.append(ctrls);
 
-  const ev = el('div', { class: 'ev' });
-  ev.append(el('em', {}, 'From: '));
-  ev.append((s.samples || []).slice(0, 6).map(x =>
-    (x.sign > 0 ? '+' : '−') + ' ' + evidenceWord(x.kind) + ' ' + x.title
-    + ' at ' + (key === 'price' ? '₹' + Math.round(x.value) : Math.round(x.value * 100) + '%')
-    + (x.reason ? ' ("' + x.reason + '")' : '')).join('  ·  ') || 'no samples');
-  row.append(ev);
-  return row;
-}
 
-function progressionPanel(t) {
-  const p = t.progression;
-  const panel = el('div', { class: 'panel' });
-  panel.append(el('h3', {}, 'Stride: ' + p.stride));
-  panel.append(el('p', {},
-    'This is learned from how far each accepted pick sat from your taste AT THE TIME it was offered — '
-    + 'not from any built-in idea of which subject follows which. If distant picks keep landing well, the '
-    + 'stride widens on its own and recommendations start drifting outward; if they keep being rejected, '
-    + 'it narrows.'));
-  panel.append(el('div', { class: 'kv' },
-    el('dt', {}, 'Appetite'), el('dd', {}, p.appetite.toFixed(2) + ' / 1.00'),
-    el('dt', {}, 'Basis'), el('dd', {}, p.basis),
-    el('dt', {}, 'Confidence'), el('dd', {}, Math.round(p.confidence * 100) + '%')));
-
-  const slider = el('input', {
-    type: 'range', min: 0, max: 100, value: Math.round(p.appetite * 100),
-    onchange: e => setOverride('progression:appetite', { mode: 'set', value: +e.target.value / 100 }),
-  });
-  panel.append(el('label', { class: 'field', style: 'margin-top:12px' },
-    el('span', {}, 'Override the stride'), slider,
-    el('small', { class: 'muted' }, 'Left keeps to what you know; right pushes further out each month.')));
-  if (state.overrides['progression:appetite']) {
-    panel.append(el('button', { class: 'tiny danger', onclick: () => clearOverride('progression:appetite') },
-      'Go back to the learned value'));
-  }
-
-  if (p.samples.length) {
-    const wrap = el('div', { class: 'tblWrap', style: 'margin-top:14px' });
-    const tbl = el('table', { class: 'tbl' });
-    tbl.append(el('thead', {}, el('tr', {},
-      el('th', {}, 'When'), el('th', {}, 'Title'), el('th', {}, 'Action'),
-      el('th', {}, 'Distance from taste at the time'))));
-    const tb = el('tbody', {});
-    for (const s of p.samples.slice(0, 25)) {
-      tb.append(el('tr', {},
-        el('td', {}, fmtDate(s.at)), el('td', {}, s.title),
-        el('td', {}, (s.sign > 0 ? '👍 ' : '👎 ') + evidenceWord(s.kind)),
-        el('td', { class: 'mono' }, s.novelty.toFixed(2))));
-    }
-    tbl.append(tb);
-    wrap.append(tbl);
-    panel.append(wrap);
-  }
-  return panel;
-}
-
-function setOverride(key, ov) {
-  if (ov.mode === 'mute' && state.overrides[key] && state.overrides[key].mode === 'mute') {
-    delete state.overrides[key];
-  } else {
-    state.overrides[key] = ov;
-  }
-  tasteCache.key = '';
-  state.ranked = null;
-  scheduleSave();
-  render();
-}
-
-function clearOverride(key) {
-  delete state.overrides[key];
-  tasteCache.key = '';
-  state.ranked = null;
-  scheduleSave();
-  render();
-}
 
 /* -------------------------------------------------------- the history view */
 /* Issue-level, not title-level. "You read Autocar India" is not a useful fact;
    "you bought the August 2026 issue for ₹150 and rated it 4" is, and it is what
    the repetition and already-have logic actually needs. */
 
-function viewHistory() {
-  const main = $('#main');
-  main.replaceChildren();
-
-  const events = state.events.slice().sort((a, b) => b.at - a.at);
-  if (!events.length) {
-    main.append(el('div', { class: 'empty' },
-      el('h3', {}, 'Nothing recorded yet'),
-      el('p', {}, 'Every recommendation, view, purchase, rating and dismissal lands here, tied to the '
-        + 'specific issue rather than just the magazine.')));
-    return;
-  }
-
-  main.append(el('h2', { class: 'sec' }, 'Timeline'));
-  main.append(el('div', { class: 'panel' },
-    el('p', {}, 'Deleting an event removes it from the evidence and the taste model is rebuilt without '
-      + 'it — the same model you would have had if it had never happened. Nothing is soft-deleted.'),
-    el('div', { class: 'btnRow' },
-      el('button', { class: 'ghost', onclick: () => { historyFilter = ''; render(); } }, 'All'),
-      ...['buy', 'rate', 'like', 'dislike', 'notInterested', 'skip', 'alreadyRead', 'view'].map(k =>
-        el('button', {
-          class: 'ghost tiny' + (historyFilter === k ? ' primary' : ''),
-          onclick: () => { historyFilter = historyFilter === k ? '' : k; render(); },
-        }, evidenceWord(k) + ' (' + events.filter(e => e.kind === k).length + ')')))));
-
-  const shown = historyFilter ? events.filter(e => e.kind === historyFilter) : events;
-
-  let lastMonth = null;
-  const tl = el('div', { class: 'tl' });
-  for (const ev of shown.slice(0, 500)) {
-    if (ev.month !== lastMonth) {
-      lastMonth = ev.month;
-      tl.append(el('div', { class: 'monthHead' }, el('h3', {}, monthLabel(ev.month)), el('hr', {})));
-    }
-    const rec = resolveRecord(ev.recordId);
-    const item = el('div', { class: 'tlItem ' + ev.kind });
-    item.append(el('div', { class: 'tlHead' },
-      el('b', {}, ev.title),
-      ev.issueLabel ? el('span', { class: 'muted' }, ev.issueLabel) : el('span', { class: 'muted' }, 'issue not recorded'),
-      el('span', { class: 'fact' }, evidenceWord(ev.kind) + (ev.kind === 'rate' ? ' ' + ev.rating + '/5' : '')),
-      ev.pricePaid != null ? el('span', { class: 'fact good' }, '₹' + ev.pricePaid + ' paid') : null,
-      ev.format ? el('span', { class: 'fact' }, ev.format) : null,
-      el('span', { class: 'tlWhen' }, fmtDate(ev.at) + ' · ' + ago(ev.at))));
-    if (ev.reason) item.append(el('div', { class: 'muted small' }, 'Reason: ' + ev.reason));
-    if (ev.note) item.append(el('div', { class: 'muted small' }, '“' + ev.note + '”'));
-    if (ev.where) item.append(el('div', { class: 'muted small' }, 'Bought at: ' + ev.where));
-    if (ev.topics && ev.topics.length) {
-      item.append(el('div', { class: 'muted small' }, 'Subjects: ' + ev.topics.join(', ')));
-    }
-    item.append(el('div', { class: 'btnRow', style: 'margin-top:6px' },
-      rec ? el('button', { class: 'tiny ghost', onclick: () => openDetail(rec) }, 'Open') : null,
-      el('button', {
-        class: 'tiny danger',
-        onclick: () => { deleteEvent(ev.id); toast('Event deleted and the model rebuilt'); render(); },
-      }, 'Delete')));
-    tl.append(item);
-  }
-  main.append(tl);
-  if (shown.length > 500) main.append(el('p', { class: 'muted small' }, 'Showing the most recent 500.'));
-}
 let historyFilter = '';
 
 /* ------------------------------------------------------- the research view */
@@ -6089,282 +5756,15 @@ let historyFilter = '';
    automated pipeline reading a dozen retailer layouts will get things wrong and
    the alternative to a correction button is a wrong answer that persists. */
 
-const RESEARCH_TABS = ['Discovered', 'Scores', 'Exclusions', 'Duplicates', 'Sources', 'Fetch log'];
 let researchTab = 'Discovered';
-let researchQuery = '';
 
-function viewResearch() {
-  const main = $('#main');
-  main.replaceChildren();
-  const r = currentCycle();
 
-  main.append(el('h2', { class: 'sec' }, 'Research'));
 
-  const head = el('div', { class: 'panel' });
-  head.append(el('h3', {}, 'Coverage'));
-  const researched = state.magazines.size;
-  head.append(el('div', { class: 'kv' },
-    el('dt', {}, 'Titles known to exist'), el('dd', {}, String(state.leads.length)),
-    el('dt', {}, 'Issue pages read'), el('dd', {}, researched + ' (' +
-      (state.leads.length ? (researched / state.leads.length * 100).toFixed(1) : '0') + '%)'),
-    el('dt', {}, 'Newsstand index read'), el('dd', {},
-      state.meta.universeAt ? ago(state.meta.universeAt) : 'never'),
-    el('dt', {}, 'Index last regenerated by the source'), el('dd', {},
-      state.meta.universePublished ? fmtDate(state.meta.universePublished)
-        + ' — anything launched since then can only arrive through web search'
-        : 'not stated'),
-    el('dt', {}, 'Last refresh'), el('dd', {},
-      state.meta.lastRefresh ? fmtDate(state.meta.lastRefresh) + ' · ' + ago(state.meta.lastRefresh) : 'never'),
-    el('dt', {}, 'Fetches this session'), el('dd', {},
-      (state.meta.counters.fetchOk || 0) + ' ok, ' + (state.meta.counters.fetchFail || 0) + ' failed')));
-  main.append(head);
 
-  const tabs = el('div', { class: 'btnRow', style: 'margin:14px 0' });
-  for (const t of RESEARCH_TABS) {
-    tabs.append(el('button', {
-      class: researchTab === t ? 'primary' : 'ghost',
-      onclick: () => { researchTab = t; render(); },
-    }, t));
-  }
-  main.append(tabs);
 
-  const body = el('div', {});
-  main.append(body);
 
-  if (researchTab === 'Discovered') body.append(researchDiscovered(r));
-  else if (researchTab === 'Scores') body.append(researchScores(r));
-  else if (researchTab === 'Exclusions') body.append(researchExclusions(r));
-  else if (researchTab === 'Duplicates') body.append(researchDuplicates());
-  else if (researchTab === 'Sources') body.append(researchSources());
-  else body.append(researchLog());
-}
 
-function searchBox(placeholder, onchange) {
-  return el('label', { class: 'field', style: 'max-width:340px;margin-bottom:12px' },
-    el('span', {}, 'Filter'),
-    el('input', { type: 'search', placeholder, value: researchQuery, oninput: e => { researchQuery = e.target.value.toLowerCase(); onchange(); } }));
-}
 
-function researchDiscovered() {
-  const wrap = el('div', {});
-  wrap.append(searchBox('title, publisher, source…', () => render()));
-
-  let recs = Array.from(state.magazines.values());
-  if (researchQuery) {
-    recs = recs.filter(r => (r.title + ' ' + (r.publisher || '') + ' ' + (r.sellers || []).join(' '))
-      .toLowerCase().includes(researchQuery));
-  }
-  recs.sort((a, b) => b.lastChecked - a.lastChecked);
-
-  const tw = el('div', { class: 'tblWrap' });
-  const tbl = el('table', { class: 'tbl' });
-  tbl.append(el('thead', {}, el('tr', {},
-    el('th', {}, 'Magazine'), el('th', {}, 'Latest issue detected'), el('th', {}, 'Evidence'),
-    el('th', {}, 'Price'), el('th', {}, 'Availability'), el('th', {}, 'Inferred topics'),
-    el('th', {}, 'Sources'), el('th', {}, 'Last checked'), el('th', {}, ''))));
-  const tb = el('tbody', {});
-  for (const rec of recs.slice(0, 400)) {
-    const iss = rec.issue || {};
-    tb.append(el('tr', {},
-      el('td', {}, el('b', {}, rec.title), rec.publisher ? el('div', { class: 'muted small' }, rec.publisher) : null),
-      el('td', {}, iss.label || el('span', { class: 'muted' }, '—'),
-        iss.parsed && iss.parsed.date ? el('div', { class: 'muted small' }, fmtDate(iss.parsed.date)) : null),
-      el('td', {},
-        el('span', { class: 'fact ' + (iss.band === 'verified' ? 'good' : iss.band === 'unknown' ? 'bad' : 'warn') },
-          Math.round((iss.confidence || 0) * 100) + '%'),
-        el('div', { class: 'muted small' }, (iss.reasons || []).slice(0, 2).join('; '))),
-      el('td', {}, fmtPrice(rec.price),
-        rec.price && rec.price.note ? el('div', { class: 'muted small' }, rec.price.note) : null),
-      el('td', {}, rec.availability),
-      el('td', {}, topEntries(rec.topics || {}, 4).map(([k, v]) => k + ' ' + Math.round(v * 100) + '%').join(', ') || '—'),
-      el('td', {}, (rec.sellers || []).join(', ')),
-      el('td', { class: 'mono' }, ago(rec.lastChecked)),
-      el('td', {},
-        el('button', { class: 'tiny ghost', onclick: () => openDetail(rec) }, 'Open'),
-        el('button', { class: 'tiny ghost', onclick: () => openEdit(rec) }, 'Correct'),
-        blockToggle(rec))));
-  }
-  tbl.append(tb);
-  tw.append(tbl);
-  wrap.append(tw);
-  if (recs.length > 400) wrap.append(el('p', { class: 'muted small' }, 'Showing 400 of ' + recs.length + '.'));
-  return wrap;
-}
-
-function researchScores(r) {
-  const wrap = el('div', {});
-  wrap.append(el('div', { class: 'panel' },
-    el('h3', {}, 'Score components'),
-    el('p', {}, 'Total = Σ weight × component. Penalties carry negative weights, so a large value in '
-      + 'the last three columns pushes a candidate DOWN. The weights are fixed in the source and shown '
-      + 'in the header so a surprising ranking can be attributed to a specific term.')));
-
-  const keys = Object.keys(WEIGHTS);
-  const tw = el('div', { class: 'tblWrap' });
-  const tbl = el('table', { class: 'tbl' });
-  tbl.append(el('thead', {}, el('tr', {},
-    el('th', {}, '#'), el('th', {}, 'Magazine'), el('th', {}, 'Total'),
-    ...keys.map(k => el('th', { title: 'weight ' + WEIGHTS[k] }, k, el('div', { class: 'muted' }, '×' + WEIGHTS[k]))))));
-  const tb = el('tbody', {});
-  const rows = r.chosen.concat(r.scored.filter(s => !r.chosen.includes(s)).slice(0, 40));
-  rows.forEach((c, i) => {
-    tb.append(el('tr', {},
-      el('td', { class: 'mono' }, String(i + 1)),
-      el('td', {}, c.rec.title, c.exploratory ? el('span', { class: 'fact' }, 'explore') : null),
-      el('td', { class: 'mono' }, c.score.toFixed(2)),
-      ...keys.map(k => {
-        const v = c.parts[k] || 0;
-        const contrib = v * (WEIGHTS[k] || 0);
-        return el('td', { title: c.notes[k] || '' },
-          el('div', { class: 'meter' }, el('i', {
-            class: contrib < 0 ? 'neg' : '',
-            style: 'width:' + Math.round(Math.abs(v) * 100) + '%',
-          })),
-          el('div', { class: 'mono muted' }, contrib.toFixed(2)));
-      })));
-  });
-  tbl.append(tb);
-  tw.append(tbl);
-  wrap.append(tw);
-  return wrap;
-}
-
-function researchExclusions(r) {
-  const wrap = el('div', {});
-  const byReason = new Map();
-  for (const ex of r.excluded) {
-    for (const f of ex.fails) {
-      if (!byReason.has(f.filter)) byReason.set(f.filter, []);
-      byReason.get(f.filter).push({ rec: ex.rec, reason: f.reason });
-    }
-  }
-  const sorted = Array.from(byReason.entries()).sort((a, b) => b[1].length - a[1].length);
-
-  wrap.append(el('div', { class: 'panel' },
-    el('h3', {}, r.excluded.length + ' titles excluded'),
-    el('p', {}, 'Grouped by which constraint removed them. A filter at the top of this list is the one '
-      + 'most narrowing your field — worth loosening first if the month looks thin.')));
-
-  for (const [filter, items] of sorted) {
-    const p = el('div', { class: 'panel' });
-    p.append(el('h3', {}, filter + ' — ' + items.length));
-    const list = items.slice(0, 25).map(i => i.rec.title + ' (' + i.reason + ')').join('; ');
-    p.append(el('div', { class: 'muted small' }, list + (items.length > 25 ? ' … and ' + (items.length - 25) + ' more' : '')));
-    wrap.append(p);
-  }
-  return wrap;
-}
-
-function researchDuplicates() {
-  const wrap = el('div', {});
-  const pairs = duplicateCandidates().slice(0, 120);
-  wrap.append(el('div', { class: 'panel' },
-    el('h3', {}, 'Possible duplicates'),
-    el('p', {}, 'The same magazine listed twice — usually two sellers, or a title that changed publisher. '
-      + 'Certain matches were merged during the refresh; these are the ones that needed a judgement. '
-      + 'Two DIFFERENT magazines about the same subject are not duplicates and should be marked distinct — '
-      + 'the ranking handles subject overlap separately.')));
-
-  if (!pairs.length) {
-    wrap.append(el('p', { class: 'muted' }, 'No unresolved candidates.'));
-    return wrap;
-  }
-  const tw = el('div', { class: 'tblWrap' });
-  const tbl = el('table', { class: 'tbl' });
-  tbl.append(el('thead', {}, el('tr', {},
-    el('th', {}, 'A'), el('th', {}, 'B'), el('th', {}, 'Match'), el('th', {}, 'Why'),
-    el('th', {}, 'Topic overlap'), el('th', {}, ''))));
-  const tb = el('tbody', {});
-  for (const p of pairs) {
-    const sim = cosine(p.a.topicVec || {}, p.b.topicVec || {});
-    tb.append(el('tr', {},
-      el('td', {}, p.a.title, el('div', { class: 'muted small' }, (p.a.publisher || '—') + ' · ' + (p.a.sellers || []).join(', '))),
-      el('td', {}, p.b.title, el('div', { class: 'muted small' }, (p.b.publisher || '—') + ' · ' + (p.b.sellers || []).join(', '))),
-      el('td', { class: 'mono' }, p.score.toFixed(2)),
-      el('td', { class: 'muted small' }, p.why),
-      el('td', { class: 'mono' }, sim.toFixed(2)),
-      el('td', {},
-        el('button', { class: 'tiny primary', onclick: () => { setMergeVerdict(p.a.id, p.b.id, 'same'); toast('Merged'); render(); } }, 'Same — merge'),
-        el('button', { class: 'tiny ghost', onclick: () => { setMergeVerdict(p.a.id, p.b.id, 'distinct'); toast('Marked distinct'); render(); } }, 'Different'))));
-  }
-  tbl.append(tb);
-  tw.append(tbl);
-  wrap.append(tw);
-  return wrap;
-}
-
-function researchSources() {
-  const wrap = el('div', {});
-  wrap.append(el('div', { class: 'panel' },
-    el('h3', {}, 'Connectors'),
-    el('p', {}, 'Each connector owns the extraction rules for one kind of site. When a retailer '
-      + 'redesigns, only its connector needs changing — nothing above this layer knows what any '
-      + 'particular page looks like.')));
-
-  const rows = [
-    ['magzter', 'Magzter (India store)', MAGZTER.sitemap, 'sitemap enumeration + issue page', 'digital, India store, 10k+ titles'],
-    ['readwhere', 'Readwhere', READWHERE.sitemap, 'sitemap enumeration only', 'titles and languages; issue data is client-rendered and unreadable'],
-    ['websearch', 'Web search', 'https://html.duckduckgo.com/html/', 'open-ended discovery', 'reaches titles no sitemap lists'],
-    ['publisher', 'Publisher sites', '—', 'generic current-issue reader', 'primary source; used where a publisher URL is known'],
-  ];
-  const tw = el('div', { class: 'tblWrap' });
-  const tbl = el('table', { class: 'tbl' });
-  tbl.append(el('thead', {}, el('tr', {}, el('th', {}, 'Connector'), el('th', {}, 'Entry point'),
-    el('th', {}, 'Role'), el('th', {}, 'Notes'), el('th', {}, 'Leads contributed'))));
-  const tb = el('tbody', {});
-  const counters = state.meta.counters || {};
-  for (const [id, name, url, role, note] of rows) {
-    const key = 'leads:' + id;
-    tb.append(el('tr', {},
-      el('td', {}, name),
-      el('td', { class: 'mono small' }, url === '—' ? '—' : el('a', { href: url, target: '_blank', rel: 'noopener' }, url)),
-      el('td', {}, role), el('td', { class: 'muted small' }, note),
-      el('td', { class: 'mono' }, String(counters[key] || 0))));
-  }
-  tbl.append(tb);
-  tw.append(tbl);
-  wrap.append(tw);
-
-  wrap.append(el('div', { class: 'panel', style: 'margin-top:14px' },
-    el('h3', {}, 'How pages are fetched'),
-    el('p', {}, 'A browser cannot read most retailer sites directly — they send no CORS header. '
-      + 'Hosts that do are read directly, which also means they are read from India and their prices '
-      + 'are the ones actually offered here. Everything else goes through a reader proxy, which lands '
-      + 'in another country; where that happens the store region is captured off the page and the price '
-      + 'is labelled accordingly rather than being presented as an Indian one.'),
-    el('div', { class: 'kv' },
-      el('dt', {}, 'Proxy chain'), el('dd', {}, PROXIES.map(p => p.label).join(' → ')),
-      el('dt', {}, 'Direct-fetch hosts'), el('dd', {}, DIRECT_OK.join(', ')),
-      el('dt', {}, 'Pace'), el('dd', {}, 'adaptive, from ' + PACE_MS + 'ms, widening on 429/5xx'))));
-  return wrap;
-}
-
-function researchLog() {
-  const wrap = el('div', {});
-  wrap.append(el('div', { class: 'panel' },
-    el('h3', {}, 'Fetch log — this session'),
-    el('p', {}, 'Every page read, with the route it took and whether it worked.')));
-  const tw = el('div', { class: 'tblWrap' });
-  const tbl = el('table', { class: 'tbl' });
-  tbl.append(el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Kind'),
-    el('th', {}, 'URL / note'), el('th', {}, 'Via'), el('th', {}, 'Status'))));
-  const tb = el('tbody', {});
-  for (const e of state.log.slice(0, 300)) {
-    tb.append(el('tr', {},
-      el('td', { class: 'mono' }, new Date(e.at).toLocaleTimeString()),
-      el('td', {}, e.kind),
-      el('td', { class: 'small' }, e.url
-        ? el('a', { href: e.url, target: '_blank', rel: 'noopener' }, e.url.slice(0, 110))
-        : (e.note || e.query || '')),
-      el('td', {}, e.via || '—'),
-      el('td', { class: e.ok ? '' : 'mono' },
-        el('span', { class: 'fact ' + (e.ok ? 'good' : 'bad') }, String(e.status || (e.ok ? 'ok' : 'fail'))))));
-  }
-  tbl.append(tb);
-  tw.append(tbl);
-  wrap.append(tw);
-  return wrap;
-}
 
 /* ------------------------------------------------------------ detail sheet */
 
@@ -6395,9 +5795,7 @@ function openDetail(rec, cand) {
   // card at the top of the month view. The hero is gone — every magazine is a
   // card in one ranked grid now — so they live here, which is where someone
   // asking "why this one?" actually goes.
-  if (cand) body.append(whyBox(cand, state.ranked || {}));
   body.append(whereBox(rec));
-  if (rec.problems.length) body.append(uncertaintyBox(rec));
   if (cand) body.append(actionRow(cand));
 
   body.append(el('h2', { class: 'sec' }, 'This issue'));
@@ -6469,7 +5867,6 @@ function openDetail(rec, cand) {
     el('button', { class: 'primary', onclick: () => { closeModal('#detailModal'); openBuy(rec); } }, 'I bought this'),
     el('button', { onclick: () => { recordEvent('like', rec); closeModal('#detailModal'); render(); } }, '👍 Like'),
     el('button', { onclick: () => { recordEvent('dislike', rec); closeModal('#detailModal'); render(); } }, '👎 Dislike'),
-    el('button', { class: 'ghost', onclick: () => openEdit(rec) }, 'Correct metadata'),
     el('button', { class: 'ghost', onclick: () => closeModal('#detailModal') }, 'Close')));
 
   openModal('#detailModal');
@@ -6477,60 +5874,6 @@ function openDetail(rec, cand) {
 
 /* ---------------------------------------------------- manual metadata edit */
 
-function openEdit(rec) {
-  const body = $('#mergeBody');
-  body.replaceChildren();
-  body.append(el('h2', {}, 'Correct: ' + rec.title));
-  body.append(el('p', { class: 'muted' },
-    'A correction is stored separately from the observations and always wins over them, so a later '
-    + 'refresh will not overwrite it. Clear a field to go back to what the sources say.'));
-
-  const fields = [
-    ['title', 'Title', rec.title],
-    ['publisher', 'Publisher', rec.publisher],
-    ['category', 'Category', rec.category],
-    ['language', 'Language', rec.language],
-    ['coverUrl', 'Cover image URL', rec.coverUrl],
-    ['frequencyLabel', 'Frequency', rec.frequency && rec.frequency.label],
-    ['availability', 'Availability (available / unknown / gone)', rec.availability],
-  ];
-  const grid = el('div', { class: 'deckGrid' });
-  const inputs = {};
-  for (const [key, label, value] of fields) {
-    const input = el('input', { type: 'text', value: value || '' });
-    inputs[key] = input;
-    grid.append(el('label', { class: 'field' }, el('span', {}, label), input,
-      rec.manual[key] != null ? el('small', { class: 'muted' }, 'currently overridden') : null));
-  }
-  body.append(grid);
-
-  body.append(el('div', { class: 'modalActions' },
-    el('button', {
-      class: 'primary',
-      onclick: () => {
-        for (const [key] of fields) {
-          const v = inputs[key].value.trim();
-          if (v) rec.manual[key] = v; else delete rec.manual[key];
-        }
-        if (rec.manual.frequencyLabel) {
-          rec.manual.frequencyDays = freqDays(rec.manual.frequencyLabel);
-        }
-        rebuildRecord(rec);
-        state.ranked = null;
-        scheduleSave();
-        closeModal('#mergeModal');
-        toast('Correction saved');
-        render();
-      },
-    }, 'Save correction'),
-    el('button', {
-      class: 'danger',
-      onclick: () => { rec.manual = {}; rebuildRecord(rec); scheduleSave(); closeModal('#mergeModal'); render(); },
-    }, 'Clear all corrections'),
-    el('button', { class: 'ghost', onclick: () => closeModal('#mergeModal') }, 'Cancel')));
-
-  openModal('#mergeModal');
-}
 
 /* ------------------------------------------------------------- filter deck */
 /* Hard constraints only. The deck is built from the corpus, so the topic and
@@ -6538,18 +5881,6 @@ function openEdit(rec) {
    because a fixed menu would quietly define what the app thinks magazines are
    about before it has read a single one. */
 
-function multiSelect(label, options, selected, onchange, hint) {
-  const sel = el('select', { multiple: true, size: Math.min(6, Math.max(3, options.length)) });
-  for (const [value, count] of options) {
-    const o = el('option', { value }, value + (count ? ' (' + count + ')' : ''));
-    if (selected.includes(value)) o.selected = true;
-    sel.append(o);
-  }
-  sel.addEventListener('change', () =>
-    onchange(Array.from(sel.selectedOptions).map(o => o.value)));
-  return el('label', { class: 'field' }, el('span', {}, label), sel,
-    hint ? el('small', { class: 'muted' }, hint) : null);
-}
 
 function selectField(label, options, value, onchange, hint) {
   const sel = el('select', { onchange: e => onchange(e.target.value) });
@@ -6897,30 +6228,16 @@ function saveBuy() {
 
 /* ------------------------------------------------------------------ render */
 
-const VIEWS = { month: viewMonth, browse: viewBrowse, taste: viewTaste, history: viewHistory, research: viewResearch };
+// One view. The app answers one question, and the four inspection views that
+// grew around it — Browse, Taste, History, Research — were answering questions
+// about the app instead. What is still worth seeing lives on the card or behind
+// Details.
 
-const VIEW_HINTS = {
-  month: 'One pick, a ranked shortlist, and the reasoning behind both. Recomputed from live data every month.',
-  browse: 'Everything that currently clears your hard filters.',
-  taste: 'What the app believes about you, the evidence for it, and the controls to correct it.',
-  history: 'Issue-level record of everything recommended, seen, bought, rated and dismissed.',
-  research: 'Sources, timestamps, extracted metadata, score arithmetic and exclusion reasons.',
-};
-
-function setView(v) {
-  state.view = v;
-  render();
-  window.scrollTo({ top: 0, behavior: 'instant' });
-}
 
 let renderToken = 0;
 
 function render() {
   renderToken++;
-  for (const tab of $$('#tabs .tab')) {
-    tab.setAttribute('aria-selected', String(tab.dataset.view === state.view));
-  }
-  $('#viewHint').textContent = VIEW_HINTS[state.view] || '';
 
   const pills = activeFilterPills();
   $('#filterCount').hidden = !pills.length;
@@ -6944,7 +6261,7 @@ function render() {
   $('#headline').textContent = headlineText();
   if (!$('#deck').hidden) renderDeck($('#deckGrid'));
 
-  (VIEWS[state.view] || viewMonth)();
+  viewMonth();
 }
 
 // How many DISTINCT consumer magazines are actually known about, as opposed to
@@ -6992,9 +6309,6 @@ function headlineText() {
 function wire() {
   $('#versionBadge').textContent = 'v' + APP_VERSION;
 
-  for (const tab of $$('#tabs .tab')) {
-    tab.addEventListener('click', () => setView(tab.dataset.view));
-  }
   $('#btnFilters').addEventListener('click', () => toggleDeck());
   $('#btnRefresh').addEventListener('click', () => runRefresh());
   $('#btnStop').addEventListener('click', () => { state.abort = true; toast('Stopping after the current fetch…'); });
@@ -7057,7 +6371,6 @@ function wire() {
   $('#btnResetTaste').addEventListener('click', () => {
     if (!confirm('Delete every recorded interaction? Filters and discovered magazines are kept. This cannot be undone.')) return;
     state.events = [];
-    state.overrides = {};
     state.meta.cycles = {};
     tasteCache.key = '';
     state.ranked = null;
@@ -7089,7 +6402,7 @@ async function exportAll() {
     version: APP_VERSION, at: Date.now(),
     magazines: Array.from(state.magazines.values()),
     leads: state.leads, events: state.events,
-    filters: state.filters, overrides: state.overrides,
+    filters: state.filters,
     merges: state.merges, blocked: state.blocked, nudges: state.nudges, meta: state.meta,
   }, null, 1)], { type: 'application/json' });
   const a = el('a', { href: URL.createObjectURL(blob), download: 'maglens-' + new Date().toISOString().slice(0, 10) + '.json' });
@@ -7107,7 +6420,6 @@ async function importAll(e) {
     state.leads = data.leads || [];
     state.events = data.events || [];
     state.filters = { ...defaultFilters(), ...(data.filters || {}) };
-    state.overrides = data.overrides || {};
     state.merges = data.merges || [];
     state.blocked = data.blocked || [];
     state.nudges = data.nudges || {};

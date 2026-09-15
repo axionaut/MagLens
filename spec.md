@@ -1113,3 +1113,139 @@ notice a pattern across a list of thirty.
 | hint appears at three unknown-language blocks and sets the filter in one click | pass |
 | taste still empty after five blocks | pass |
 | v4–v8 suites | all pass |
+
+## 11. v10 — back to the drawing board: one view, real article text, rotation
+
+Raised as a whole-app judgement: *"for a magazine recommendation engine, it's a
+bit too over-engineered and massive… The layout on home is fine and duel is good
+but rest of the stuff is too much overkill. Instead you should focus more on how
+to learn, read the actual content of magazines."*
+
+Fair. Nine releases of answering specific reports had grown 2,262 lines of UI, most
+of it answering questions about the app rather than about magazines.
+
+### 11.1 What was removed
+
+| removed | why |
+|---|---|
+| Browse | §9 made the home page list every eligible title; Browse was the same list with a sort box |
+| Research (6 tabs) | discovered / scores / exclusions / duplicates / sources / fetch log — an audit surface for a single-user app |
+| History | a timeline of every event, read by nobody |
+| Taste (3 panels) | topic tables, scalar rows, progression chart, mute/pin overrides |
+| Edit record | manual field correction |
+| Merge queue | duplicate review UI (`autoMerge` stays) |
+| overrides machinery | unreachable once the Taste view went; dead code that can never run is worse than none |
+| rating widget, cycle summary, why/uncertainty boxes | replaced by the duel and by the one-line reason already on each card |
+
+`app.js` 7,161 → 6,473 lines and `index.html` 173 → 160, with ~1,250 lines of the
+diff being deletion. What survives is the home grid, the duel, the filters, the
+detail modal and blocking.
+
+`factRow`, `confidenceFact`, `multiSelect` and `whereBox` were deleted and then
+restored: the filter deck and the detail modal still need them, and "where to buy"
+is not inspection, it is the answer to the question the app exists for.
+
+### 11.2 Reading what a magazine actually says
+
+Until now topics came from cover lines, a shelf category and a blurb — what an
+issue *advertises* about itself. Magzter publishes per-article story pages whose
+URLs were already being parsed and never fetched.
+
+A story page carries two things:
+
+1. the opening paragraphs of a real article, before the paywall cut, plus its
+   byline and publication date;
+2. a "more from this issue" block of about ten sibling articles, each with a
+   headline and a full standfirst.
+
+The second is what makes it affordable. **One request per issue yields the prose
+of one piece and a summary of ten more**, so reading an issue properly costs one
+fetch rather than ten — which is why every issue the budget touches can have one.
+The longest piece is chosen rather than the first: a two-minute front-of-book item
+is a caption, while the long read is what the magazine is for.
+
+Measured on a live India Today issue, topic shares before and after:
+
+```
+without article text : art 11%, food 10%, design 6%, law 6%, travel 5%
+with one story read  : finance 16%, art 7%, politics 7%, food 6%, economy 6%
+```
+
+The old reading called a news weekly an art-and-food magazine, from fragments of
+cover lines. Reading one article surfaced `economy`, `finance` and `manufacturing`,
+none of which were visible before, and moved newsiness 0.66 → 0.70. Article prose
+is weighted above cover lines in the pool, because a cover line is written to sell
+the issue and this is the issue.
+
+### 11.3 Rotation, by construction
+
+The overlap penalty is a gradient: a subject the model is confident about can pay
+it repeatedly and still win, so the top of the list drifts into six variations on
+one theme — the rut the app exists to avoid. A penalty large enough to stop that
+would wreck the ranking further down.
+
+`ROTATION_DEPTH = 12`: inside the first twelve rows, a primary subject already
+taken is **skipped outright rather than taxed**, because a penalty is something a
+strong candidate buys its way through. Below the depth ordinary scoring resumes,
+and if every remaining candidate repeats a subject the constraint lifts rather than
+truncating the list.
+
+`primarySubject` uses ontology names only — a mined phrase is specific to one issue,
+so two magazines sharing one is a coincidence, not a repetition.
+
+Tested against a corpus of 14 car magazines and 24 others: **exactly one car
+magazine in the top twelve**, the full 38-title list intact, and cars still
+available further down.
+
+### 11.4 Amazon.in is a viable source after all
+
+Challenged directly: the sources are too sparse, and everything must be on Amazon.
+Correct, and §4.8 was wrong to leave it untested — that section recorded PressReader
+and three others failing and never tried Amazon, having assumed anti-bot behaviour
+from a 403 on a different host.
+
+Amazon.in reads through the same proxy. A product page yields everything this app
+needs, and for print, which Magzter cannot give:
+
+```
+Title: India Today Magazine - 17 August 2026 - The Battle Over Eggs
+{"displayPrice":"₹100.00","priceAmount":100.00}
+Format: Single Issue Magazine
+Language  English
+Publisher  Living Media India Limited
+```
+
+A real single-issue rupee price, and an **explicit language field** — which
+addresses §4.1 at its root rather than by inference. A parser for the product page
+is written and verified against the saved page; extraction of all six fields is
+exact.
+
+Search-result extraction is *not* reliable: the page is dominated by sponsored
+redirects, product titles survive only inside image alt text, and the visible
+currency figures are delivery charges rather than prices. One ASIN was recovered
+from a search page where a dozen were expected. Discovery will therefore go via the
+existing web-search connector (`site:amazon.in`), which returns plain URLs, rather
+than by scraping Amazon's own search. **No Amazon connector is wired in yet** — it
+lands as its own release, for the reason in §4.8 that has not changed.
+
+### 11.5 Verification
+
+| test | result |
+|---|---|
+| home renders, duel present, 40 cards | pass |
+| duel records a preference; vote records a nudge | pass |
+| detail modal and filter deck intact (19 fields) | pass |
+| every `$('#id')` in app.js resolves in index.html | 43/43 |
+| story parser: 1,837 chars of prose, byline, 10 siblings | pass |
+| topic extraction improves on a live issue | see §11.2 |
+| rotation: 1 of 14 car magazines in the top 12 | pass |
+| 600-title full-list render, block, nudge, dupes, cause suites | pass |
+
+### 11.6 Still open
+
+The duel is next. DramTrack runs a **binary-search insertion** duel — `choose()`
+halves a `low`/`high` window on each answer, placing a new item into a total
+ordering in about log₂(n) comparisons, and the resulting position *is* the score.
+MagLens instead draws a random cross-genre pair and feeds a statistical model.
+Reworking MagLens's duel to that shape is the next release, together with the
+Amazon connector.

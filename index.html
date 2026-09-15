@@ -15,13 +15,6 @@
   <div class="barMain">
     <div class="brand">MagLens <span id="versionBadge" class="badge">v2</span></div>
 
-    <nav class="tabs" id="tabs" role="tablist" aria-label="Views">
-      <button class="tab" role="tab" data-view="month"    aria-selected="false">This Month</button>
-      <button class="tab" role="tab" data-view="browse"   aria-selected="false">Browse</button>
-      <button class="tab" role="tab" data-view="taste"    aria-selected="false">Taste</button>
-      <button class="tab" role="tab" data-view="history"  aria-selected="false">History</button>
-      <button class="tab" role="tab" data-view="research" aria-selected="false">Research</button>
-    </nav>
 
     <div class="barRight">
       <button id="btnFilters" class="ghost" aria-expanded="false" aria-controls="deck">
@@ -39,7 +32,6 @@
   <div class="barStats" id="barStats">
     <div class="headline" id="headline" aria-live="polite"></div>
     <div id="activePills" class="pills"></div>
-    <div id="viewHint" class="viewHint"></div>
   </div>
 
   <!-- Hard constraints. Deliberately separate from anything learned: nothing in
@@ -161,13 +153,8 @@
   </div>
 </div>
 
-<!-- ------------------------------------------------------------ merge sheet -->
-<div id="mergeModal" class="modal" hidden>
-  <div class="modalBody wide" id="mergeBody"></div>
-</div>
+<!-- ------------------------------------------------------------ merge sheet --><div id="toast" class="toast" hidden></div>
 
-<div id="toast" class="toast" hidden></div>
-
-<script src="app.js?v=3"></script>
+<script src="app.js?v=10"></script>
 </body>
 </html>

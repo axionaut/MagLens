@@ -432,6 +432,12 @@ h2.sec:first-child { margin-top: 0; }
   background: var(--bg3); border: 1px solid var(--line);
   border-radius: 6px; padding: 6px 10px; font-size: 12.5px;
 }
+.blockHint {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 8px; padding: 8px 10px; font-size: 12px; line-height: 1.45;
+  border: 1px solid #6a5326; border-radius: 6px; color: var(--accent);
+  background: rgba(232,176,75,.06);
+}
 .blockRow .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .blockRow .when { color: var(--fg3); font: 11px/1 var(--mono); white-space: nowrap; }
 

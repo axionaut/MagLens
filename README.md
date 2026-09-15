@@ -208,6 +208,11 @@ already subscribe, or because it is not sold near them, and a block that quietly
 trained against the subject would punish a whole shelf for a fact about one
 magazine. Downvote as well if you also dislike it.
 
+Because blocking is usually a filter that missed, the cause is noted from what
+is already known about the title — no language established, another language,
+adult material — and when one keeps recurring the filter deck offers the setting
+that would have caught them, in one click.
+
 Blocking is one click with an undo in the toast; the full list, with per-title
 unblock, is in the filter deck. It survives *Reset filters*, because resetting
 your price ceiling should not silently unblock a dozen titles.

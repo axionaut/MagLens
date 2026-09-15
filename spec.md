@@ -1038,3 +1038,78 @@ confirm a mechanical edit landed as intended.
 | re-render mid-fill leaves no duplicate cards | 600, not 1200 |
 | selection timing at 3000 titles | 486 ms |
 | v4–v7 suites | all pass |
+
+## 10. v9 — a block leaves no mark on taste at all
+
+Raised as a correction to the design: *"Reason I block a magazine can be that
+it's either not appropriate or the language is not English (regional mostly). So
+I don't think block should contribute to learning as it has seldom to do with my
+dislikes."*
+
+Correct, and it was already the intent — §5.1 records blocking as the one control
+that teaches nothing, and §5.2 records the `0 || 0.2` trap that would have made it
+train at 0.2 despite a zero weight. `buildTaste` skips `block` outright, so it
+moves no topic, facet, scalar, centroid or progression figure. Verified rather
+than asserted.
+
+### 10.1 One leak survived, in the scoring rather than the model
+
+`historyContext` built a `judged` set — titles the user has ruled on — used to
+switch off the `novelty` and `exploration` cold-start terms, which measure an
+ignorance that a judgement has dispelled. It excluded the passive kinds (`view`,
+`open`) and included everything else, `block` among them.
+
+While a title is blocked this is invisible, because a blocked title never reaches
+the ranking. It bites on **unblock**: the title returns permanently stripped of
+both cold-start terms, as though it had been judged.
+
+Measured against the previous release, blocking and then unblocking a title the
+user had never expressed any taste about:
+
+```
+Film Reel:6.212236  ->  Film Reel:5.541378     (rank 1 -> rank 3)
+```
+
+0.67 points and two places, from a control documented as teaching nothing. Fixed
+by excluding `block` alongside the passive kinds. A block must leave no mark on
+scoring whatsoever, and the regression test now asserts that a block/unblock
+round trip returns every score bit-identical.
+
+### 10.2 A block is a filter that missed
+
+The reasons given — not appropriate, wrong language — are both statements about
+the shelf rather than about taste, and both describe a filter that failed to
+catch something. Blocking them one at a time treats the symptom.
+
+`blockCause(rec)` reads the cause off what is already known about the record at
+the moment it is blocked: flagged explicit, no language established, or a
+language other than the ones allowed. No dialog and no extra click — asking for a
+reason would make blocking slow enough to go unused, and the two reasons that
+actually arise already leave evidence on the record.
+
+It is not taste data, is never trained on, and is used for exactly one thing:
+when a cause repeats, the filter deck says so once and offers the setting that
+would have caught them —
+
+- three or more blocked for an unestablished language, while
+  `unknownLanguage` is `latin` → offer `strict`;
+- two or more blocked for another language, while the language filter accepts
+  any → offer English only;
+- two or more blocked as adult material, while `hideExplicit` is off → offer to
+  turn it on.
+
+One click each. The point is to fix the filter once rather than have the user
+notice a pattern across a list of thirty.
+
+### 10.3 Verification
+
+| test | result |
+|---|---|
+| taste model identical before and after a block | pass |
+| block recorded in History, absent from the ranking | pass |
+| block → unblock returns every score bit-identical | pass |
+| the same test against v8 | fails, as expected: −0.67 and two places |
+| causes captured for unknown, other-language and explicit | 5/5 |
+| hint appears at three unknown-language blocks and sets the filter in one click | pass |
+| taste still empty after five blocks | pass |
+| v4–v8 suites | all pass |

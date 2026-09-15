@@ -47,7 +47,7 @@
    changes constantly; nothing outside that section may know what a Magzter page
    looks like.                                                                */
 
-const APP_VERSION = 8;
+const APP_VERSION = 9;
 
 /* ============================================================== constants  */
 
@@ -2983,11 +2983,34 @@ function isBlocked(rec) {
   return (state.blocked || []).some(b => b.id === rec.id || (b.canon && b.canon === canon));
 }
 
+// Why this title was blockable, read off what is already known about it. No
+// dialog and no extra click: asking for a reason would make blocking slow enough
+// to go unused, and the two reasons that actually come up leave evidence on the
+// record anyway.
+//
+// This is not taste data and is never trained on. It exists because a block is
+// usually a FILTER that missed — "I cannot read this" and "I do not want this on
+// screen" are both statements about the shelf — and a filter that keeps missing
+// is worth fixing once instead of blocking one title at a time.
+function blockCause(rec) {
+  const c = rec.content || {};
+  if (c.explicit) return { code: 'explicit', label: 'adult material that got past the filter' };
+  if (!rec.language) {
+    return { code: 'language-unknown', label: 'no language could be established for this title' };
+  }
+  if (rec.language !== 'English') {
+    return { code: 'language-other', label: 'published in ' + rec.language };
+  }
+  return { code: 'other', label: null };
+}
+
 function blockRecord(rec, note) {
   if (isBlocked(rec)) return;
+  const cause = blockCause(rec);
   state.blocked.push({
     id: rec.id, canon: blockKey(rec), title: rec.title,
     at: Date.now(), note: note || null,
+    cause: cause.code, causeLabel: cause.label,
   });
   // Recorded so the History timeline shows it. EVENT_WEIGHT.block is 0 — see
   // the note above; this must not move the taste model.
@@ -3824,12 +3847,21 @@ function historyContext() {
     }
   }
 
-  // Titles the user has expressed any direct judgement about, either side of a
-  // comparison included. Used only to switch off the cold-start terms, which
-  // measure ignorance the user has already dispelled.
+  // Titles the user has expressed any direct judgement about their TASTE for,
+  // either side of a comparison included. Used only to switch off the cold-start
+  // terms, which measure an ignorance the user has already dispelled.
+  //
+  // `block` is excluded along with the two passive kinds, and for a stronger
+  // reason than either. People block a magazine because it is in a language they
+  // cannot read or because it is not something they want on screen — reasons
+  // about the SHELF, not about their taste. Leaving it in meant a blocked title
+  // came back from an unblock permanently stripped of its novelty and
+  // exploration terms, as though it had been judged. Invisible while blocked,
+  // since a blocked title never reaches the ranking at all, and wrong the moment
+  // it is unblocked. A block must leave no mark on scoring whatsoever.
   const judged = new Set();
   for (const ev of state.events) {
-    if (ev.kind === 'view' || ev.kind === 'open') continue;
+    if (ev.kind === 'view' || ev.kind === 'open' || ev.kind === 'block') continue;
     const rec = resolveRecord(ev.recordId);
     judged.add(rec ? rec.id : ev.recordId);
     if (ev.loserId) judged.add(ev.loserId);
@@ -6617,18 +6649,57 @@ function renderDeck(target, opts = {}) {
     const list = el('div', { class: 'blockList' });
     for (const b of state.blocked.slice().sort((x, y) => y.at - x.at)) {
       list.append(el('div', { class: 'blockRow' },
-        el('span', { class: 't' }, b.title || b.id),
+        el('span', { class: 't' }, b.title || b.id,
+          b.causeLabel ? el('div', { class: 'muted small' }, b.causeLabel) : null),
         el('span', { class: 'when' }, ago(b.at)),
         el('button', {
           class: 'tiny',
           onclick: () => { unblockRecord(b); render(); },
         }, 'Unblock')));
     }
+
+    // A repeated cause is a filter that is not doing its job. Said once, with
+    // the setting that would have caught them, rather than left for the user to
+    // notice across a list of thirty.
+    const byCause = {};
+    for (const b of state.blocked) byCause[b.cause || 'other'] = (byCause[b.cause || 'other'] || 0) + 1;
+    const unknownLang = byCause['language-unknown'] || 0;
+    const otherLang = byCause['language-other'] || 0;
+    const explicit = byCause.explicit || 0;
+
+    if (unknownLang >= 3 && f.unknownLanguage !== 'strict') {
+      wrap.append(el('div', { class: 'blockHint' },
+        el('span', {}, unknownLang + ' of these were blocked because no language could be '
+          + 'established for them. Dropping titles that cannot be confirmed English would '
+          + 'have caught them before they were ever shown.'),
+        el('button', {
+          class: 'tiny primary',
+          onclick: () => { f.unknownLanguage = 'strict'; state.ranked = null; scheduleSave(); render(); },
+        }, 'Drop unconfirmed languages')));
+    }
+    if (otherLang >= 2 && !f.languages.length) {
+      wrap.append(el('div', { class: 'blockHint' },
+        el('span', {}, otherLang + ' were blocked for their language while the language '
+          + 'filter is set to accept any.'),
+        el('button', {
+          class: 'tiny primary',
+          onclick: () => { f.languages = ['English']; state.ranked = null; scheduleSave(); render(); },
+        }, 'English only')));
+    }
+    if (explicit >= 2 && !f.hideExplicit) {
+      wrap.append(el('div', { class: 'blockHint' },
+        el('span', {}, explicit + ' were adult material, which the filter is currently set to show.'),
+        el('button', {
+          class: 'tiny primary',
+          onclick: () => { f.hideExplicit = true; state.ranked = null; scheduleSave(); render(); },
+        }, 'Hide adult material')));
+    }
     wrap.append(list);
     wrap.append(el('small', { class: 'muted' },
       'Blocked titles never appear in the ranking, in Browse, or as one side of a '
-      + 'comparison. Blocking teaches the taste model nothing — downvote as well if '
-      + 'you also dislike the subject.'));
+      + 'comparison, and blocking teaches the taste model nothing at all — not the '
+      + 'subject, not the publisher, not the price. It is a hard constraint, like a '
+      + 'filter. Downvote as well if you also dislike the subject.'));
     target.append(wrap);
   }
 
